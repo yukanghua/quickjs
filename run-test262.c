@@ -848,6 +848,7 @@ static JSModuleDef *js_module_loader_test(JSContext *ctx,
                                           const char *module_name, void *opaque,
                                           JSValueConst attributes)
 {
+    JSRuntime *rt = JS_GetRuntime(ctx);
     size_t buf_len;
     uint8_t *buf;
     JSModuleDef *m;

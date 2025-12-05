@@ -65,7 +65,9 @@ typedef sig_t sighandler_t;
 #endif
 
 /* enable the os.Worker API. It relies on POSIX threads */
+#ifndef _WIN32
 #define USE_WORKER
+#endif
 
 #ifdef USE_WORKER
 #include <pthread.h>
@@ -541,6 +543,7 @@ static JSModuleDef *js_module_loader_so(JSContext *ctx,
 int js_module_set_import_meta(JSContext *ctx, JSValueConst func_val,
                               JS_BOOL use_realpath, JS_BOOL is_main)
 {
+    JSRuntime *rt = JS_GetRuntime(ctx);
     JSModuleDef *m;
     char buf[PATH_MAX + 16];
     JSValue meta_obj;
@@ -678,6 +681,7 @@ JSModuleDef *js_module_loader(JSContext *ctx,
                               const char *module_name, void *opaque,
                               JSValueConst attributes)
 {
+    JSRuntime *rt = JS_GetRuntime(ctx);
     JSModuleDef *m;
     int res;
     
@@ -929,7 +933,7 @@ typedef struct {
 
 static void js_std_file_finalizer(JSRuntime *rt, JSValue val)
 {
-    JSSTDFile *s = JS_GetOpaque(val, js_std_file_class_id);
+    JSSTDFile *s = JS_GetOpaque(rt, val, js_std_file_class_id);
     if (s) {
         if (s->f && s->close_in_finalizer) {
             if (s->is_popen)
@@ -989,7 +993,7 @@ static JSValue js_new_std_file(JSContext *ctx, FILE *f,
     s->close_in_finalizer = close_in_finalizer;
     s->is_popen = is_popen;
     s->f = f;
-    JS_SetOpaque(obj, s);
+    JS_SetOpaque(JS_GetRuntime(ctx), obj, s);
     return obj;
 }
 
@@ -3551,7 +3555,7 @@ static void js_free_port(JSRuntime *rt, JSWorkerMessageHandler *port)
 
 static void js_worker_finalizer(JSRuntime *rt, JSValue val)
 {
-    JSWorkerData *worker = JS_GetOpaque(val, js_worker_class_id);
+    JSWorkerData *worker = JS_GetOpaque(rt, val, js_worker_class_id);
     if (worker) {
         js_free_message_pipe(worker->recv_pipe);
         js_free_message_pipe(worker->send_pipe);
@@ -3563,7 +3567,7 @@ static void js_worker_finalizer(JSRuntime *rt, JSValue val)
 static void js_worker_mark(JSRuntime *rt, JSValueConst val,
                            JS_MarkFunc *mark_func)
 {
-    JSWorkerData *worker = JS_GetOpaque(val, js_worker_class_id);
+    JSWorkerData *worker = JS_GetOpaque(rt, val, js_worker_class_id);
     if (worker) {
         JSWorkerMessageHandler *port = worker->msg_handler;
         if (port) {
@@ -3654,7 +3658,7 @@ static JSValue js_worker_ctor_internal(JSContext *ctx, JSValueConst new_target,
     s->recv_pipe = js_dup_message_pipe(recv_pipe);
     s->send_pipe = js_dup_message_pipe(send_pipe);
 
-    JS_SetOpaque(obj, s);
+    JS_SetOpaque(JS_GetRuntime(ctx), obj, s);
     return obj;
  fail:
     JS_FreeValue(ctx, obj);

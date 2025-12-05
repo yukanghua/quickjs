@@ -241,14 +241,14 @@ endif
 endif
 endif
 
-all: $(OBJDIR) $(OBJDIR)/quickjs.check.o $(OBJDIR)/qjs.check.o $(PROGS)
+all: $(OBJDIR) $(PROGS)
 
 QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/dtoa.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o
 
 QJS_OBJS=$(OBJDIR)/qjs.o $(OBJDIR)/repl.o $(QJS_LIB_OBJS)
 
-HOST_LIBS=-lm -ldl -lpthread
-LIBS=-lm -lpthread
+HOST_LIBS=-lm -ldl
+LIBS=-lm
 ifndef CONFIG_WIN32
 LIBS+=-ldl
 endif
@@ -349,9 +349,6 @@ $(OBJDIR)/%.debug.o: %.c | $(OBJDIR)
 
 $(OBJDIR)/%.fuzz.o: %.c | $(OBJDIR)
 	$(CC) $(CFLAGS_OPT) -fsanitize=fuzzer-no-link -c -o $@ $<
-
-$(OBJDIR)/%.check.o: %.c | $(OBJDIR)
-	$(CC) $(CFLAGS) -DCONFIG_CHECK_JSVALUE -c -o $@ $<
 
 regexp_test: libregexp.c libunicode.c cutils.c
 	$(CC) $(LDFLAGS) $(CFLAGS) -DTEST -o $@ libregexp.c libunicode.c cutils.c $(LIBS)
