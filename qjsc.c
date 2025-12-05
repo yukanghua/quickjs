@@ -240,6 +240,7 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
                                const char *module_name, void *opaque,
                                JSValueConst attributes)
 {
+    JSRuntime*rt = JS_GetRuntime(ctx);
     JSModuleDef *m;
     namelist_entry_t *e;
 

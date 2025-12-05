@@ -60,18 +60,12 @@ typedef uint32_t JSAtom;
 #define JS_PTR64_DEF(a)
 #endif
 
-#ifndef JS_PTR64
-#define JS_NAN_BOXING
-#endif
-
 #if defined(__SIZEOF_INT128__) && (INTPTR_MAX >= INT64_MAX)
 #define JS_LIMB_BITS 64
 #else
 #define JS_LIMB_BITS 32
 #endif
 
-#define JS_SHORT_BIG_INT_BITS JS_LIMB_BITS
-    
 enum {
     /* all tags with a reference count are negative */
     JS_TAG_FIRST       = -9, /* first negative tag */
@@ -90,8 +84,7 @@ enum {
     JS_TAG_UNINITIALIZED = 4,
     JS_TAG_CATCH_OFFSET = 5,
     JS_TAG_EXCEPTION   = 6,
-    JS_TAG_SHORT_BIG_INT = 7,
-    JS_TAG_FLOAT64     = 8,
+    JS_TAG_FLOAT64     = 7,
     /* any larger tag is FLOAT64 if JS_NAN_BOXING */
 };
 
@@ -101,48 +94,6 @@ typedef struct JSRefCountHeader {
 
 #define JS_FLOAT64_NAN NAN
 
-#ifdef CONFIG_CHECK_JSVALUE
-/* JSValue consistency : it is not possible to run the code in this
-   mode, but it is useful to detect simple reference counting
-   errors. It would be interesting to modify a static C analyzer to
-   handle specific annotations (clang has such annotations but only
-   for objective C) */
-typedef struct __JSValue *JSValue;
-typedef const struct __JSValue *JSValueConst;
-
-#define JS_VALUE_GET_TAG(v) (int)((uintptr_t)(v) & 0xf)
-/* same as JS_VALUE_GET_TAG, but return JS_TAG_FLOAT64 with NaN boxing */
-#define JS_VALUE_GET_NORM_TAG(v) JS_VALUE_GET_TAG(v)
-#define JS_VALUE_GET_INT(v) (int)((intptr_t)(v) >> 4)
-#define JS_VALUE_GET_BOOL(v) JS_VALUE_GET_INT(v)
-#define JS_VALUE_GET_FLOAT64(v) (double)JS_VALUE_GET_INT(v)
-#define JS_VALUE_GET_SHORT_BIG_INT(v) JS_VALUE_GET_INT(v)
-#define JS_VALUE_GET_PTR(v) (void *)((intptr_t)(v) & ~0xf)
-
-#define JS_MKVAL(tag, val) (JSValue)(intptr_t)(((val) << 4) | (tag))
-#define JS_MKPTR(tag, p) (JSValue)((intptr_t)(p) | (tag))
-
-#define JS_TAG_IS_FLOAT64(tag) ((unsigned)(tag) == JS_TAG_FLOAT64)
-
-#define JS_NAN JS_MKVAL(JS_TAG_FLOAT64, 1)
-
-static inline JSValue __JS_NewFloat64(JSContext *ctx, double d)
-{
-    return JS_MKVAL(JS_TAG_FLOAT64, (int)d);
-}
-
-static inline JS_BOOL JS_VALUE_IS_NAN(JSValue v)
-{
-    return 0;
-}
-
-static inline JSValue __JS_NewShortBigInt(JSContext *ctx, int32_t d)
-{
-    return JS_MKVAL(JS_TAG_SHORT_BIG_INT, d);
-}
-
-#elif defined(JS_NAN_BOXING)
-
 typedef uint64_t JSValue;
 
 #define JSValueConst JSValue
@@ -150,11 +101,10 @@ typedef uint64_t JSValue;
 #define JS_VALUE_GET_TAG(v) (int)((v) >> 32)
 #define JS_VALUE_GET_INT(v) (int)(v)
 #define JS_VALUE_GET_BOOL(v) (int)(v)
-#define JS_VALUE_GET_SHORT_BIG_INT(v) (int)(v)
-#define JS_VALUE_GET_PTR(v) (void *)(intptr_t)(v)
+#define JS_VALUE_GET_PTR(v) (void *)((intptr_t)rt + (int)(v))
 
 #define JS_MKVAL(tag, val) (((uint64_t)(tag) << 32) | (uint32_t)(val))
-#define JS_MKPTR(tag, ptr) (((uint64_t)(tag) << 32) | (uintptr_t)(ptr))
+#define JS_MKPTR(tag, ptr) (((uint64_t)(tag) << 32) | ((intptr_t)(ptr) - (intptr_t)rt))
 
 #define JS_FLOAT64_TAG_ADDEND (0x7ff80000 - JS_TAG_FIRST + 1) /* quiet NaN encoding */
 
@@ -206,77 +156,6 @@ static inline JS_BOOL JS_VALUE_IS_NAN(JSValue v)
     tag = JS_VALUE_GET_TAG(v);
     return tag == (JS_NAN >> 32);
 }
-
-static inline JSValue __JS_NewShortBigInt(JSContext *ctx, int32_t d)
-{
-    return JS_MKVAL(JS_TAG_SHORT_BIG_INT, d);
-}
-
-#else /* !JS_NAN_BOXING */
-
-typedef union JSValueUnion {
-    int32_t int32;
-    double float64;
-    void *ptr;
-#if JS_SHORT_BIG_INT_BITS == 32
-    int32_t short_big_int;
-#else
-    int64_t short_big_int;
-#endif
-} JSValueUnion;
-
-typedef struct JSValue {
-    JSValueUnion u;
-    int64_t tag;
-} JSValue;
-
-#define JSValueConst JSValue
-
-#define JS_VALUE_GET_TAG(v) ((int32_t)(v).tag)
-/* same as JS_VALUE_GET_TAG, but return JS_TAG_FLOAT64 with NaN boxing */
-#define JS_VALUE_GET_NORM_TAG(v) JS_VALUE_GET_TAG(v)
-#define JS_VALUE_GET_INT(v) ((v).u.int32)
-#define JS_VALUE_GET_BOOL(v) ((v).u.int32)
-#define JS_VALUE_GET_FLOAT64(v) ((v).u.float64)
-#define JS_VALUE_GET_SHORT_BIG_INT(v) ((v).u.short_big_int)
-#define JS_VALUE_GET_PTR(v) ((v).u.ptr)
-
-#define JS_MKVAL(tag, val) (JSValue){ (JSValueUnion){ .int32 = val }, tag }
-#define JS_MKPTR(tag, p) (JSValue){ (JSValueUnion){ .ptr = p }, tag }
-
-#define JS_TAG_IS_FLOAT64(tag) ((unsigned)(tag) == JS_TAG_FLOAT64)
-
-#define JS_NAN (JSValue){ .u.float64 = JS_FLOAT64_NAN, JS_TAG_FLOAT64 }
-
-static inline JSValue __JS_NewFloat64(JSContext *ctx, double d)
-{
-    JSValue v;
-    v.tag = JS_TAG_FLOAT64;
-    v.u.float64 = d;
-    return v;
-}
-
-static inline JS_BOOL JS_VALUE_IS_NAN(JSValue v)
-{
-    union {
-        double d;
-        uint64_t u64;
-    } u;
-    if (v.tag != JS_TAG_FLOAT64)
-        return 0;
-    u.d = v.u.float64;
-    return (u.u64 & 0x7fffffffffffffff) > 0x7ff0000000000000;
-}
-
-static inline JSValue __JS_NewShortBigInt(JSContext *ctx, int64_t d)
-{
-    JSValue v;
-    v.tag = JS_TAG_SHORT_BIG_INT;
-    v.u.short_big_int = d;
-    return v;
-}
-
-#endif /* !JS_NAN_BOXING */
 
 #define JS_VALUE_IS_BOTH_INT(v1, v2) ((JS_VALUE_GET_TAG(v1) | JS_VALUE_GET_TAG(v2)) == 0)
 #define JS_VALUE_IS_BOTH_FLOAT(v1, v2) (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v1)) && JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(v2)))
@@ -352,6 +231,7 @@ typedef struct JSMallocState {
     size_t malloc_size;
     size_t malloc_limit;
     void *opaque; /* user opaque */
+    void *firstfree[28];
 } JSMallocState;
 
 typedef struct JSMallocFunctions {
@@ -543,7 +423,7 @@ typedef struct JSClassDef {
 #define JS_INVALID_CLASS_ID 0
 JSClassID JS_NewClassID(JSClassID *pclass_id);
 /* Returns the class ID if `v` is an object, otherwise returns JS_INVALID_CLASS_ID. */
-JSClassID JS_GetClassID(JSValue v);
+JSClassID JS_GetClassID(JSRuntime *rt, JSValue v);
 int JS_NewClass(JSRuntime *rt, JSClassID class_id, const JSClassDef *class_def);
 int JS_IsRegisteredClass(JSRuntime *rt, JSClassID class_id);
 
@@ -617,7 +497,7 @@ static inline JS_BOOL JS_IsNumber(JSValueConst v)
 static inline JS_BOOL JS_IsBigInt(JSContext *ctx, JSValueConst v)
 {
     int tag = JS_VALUE_GET_TAG(v);
-    return tag == JS_TAG_BIG_INT || tag == JS_TAG_SHORT_BIG_INT;
+    return tag == JS_TAG_BIG_INT;
 }
 
 static inline JS_BOOL JS_IsBool(JSValueConst v)
@@ -674,44 +554,10 @@ JSValue __js_printf_like(2, 3) JS_ThrowRangeError(JSContext *ctx, const char *fm
 JSValue __js_printf_like(2, 3) JS_ThrowInternalError(JSContext *ctx, const char *fmt, ...);
 JSValue JS_ThrowOutOfMemory(JSContext *ctx);
 
-void __JS_FreeValue(JSContext *ctx, JSValue v);
-static inline void JS_FreeValue(JSContext *ctx, JSValue v)
-{
-    if (JS_VALUE_HAS_REF_COUNT(v)) {
-        JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
-        if (--p->ref_count <= 0) {
-            __JS_FreeValue(ctx, v);
-        }
-    }
-}
-void __JS_FreeValueRT(JSRuntime *rt, JSValue v);
-static inline void JS_FreeValueRT(JSRuntime *rt, JSValue v)
-{
-    if (JS_VALUE_HAS_REF_COUNT(v)) {
-        JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
-        if (--p->ref_count <= 0) {
-            __JS_FreeValueRT(rt, v);
-        }
-    }
-}
-
-static inline JSValue JS_DupValue(JSContext *ctx, JSValueConst v)
-{
-    if (JS_VALUE_HAS_REF_COUNT(v)) {
-        JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
-        p->ref_count++;
-    }
-    return (JSValue)v;
-}
-
-static inline JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
-{
-    if (JS_VALUE_HAS_REF_COUNT(v)) {
-        JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
-        p->ref_count++;
-    }
-    return (JSValue)v;
-}
+void JS_FreeValue(JSContext *ctx, JSValue v);
+void JS_FreeValueRT(JSRuntime *rt, JSValue v);
+JSValue JS_DupValue(JSContext *ctx, JSValueConst v);
+JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v);
 
 JS_BOOL JS_StrictEq(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 JS_BOOL JS_SameValue(JSContext *ctx, JSValueConst op1, JSValueConst op2);
@@ -844,10 +690,10 @@ int JS_DefinePropertyValueStr(JSContext *ctx, JSValueConst this_obj,
 int JS_DefinePropertyGetSet(JSContext *ctx, JSValueConst this_obj,
                             JSAtom prop, JSValue getter, JSValue setter,
                             int flags);
-void JS_SetOpaque(JSValue obj, void *opaque);
-void *JS_GetOpaque(JSValueConst obj, JSClassID class_id);
+void JS_SetOpaque(JSRuntime *rt, JSValue obj, void *opaque);
+void *JS_GetOpaque(JSRuntime *rt, JSValueConst obj, JSClassID class_id);
 void *JS_GetOpaque2(JSContext *ctx, JSValueConst obj, JSClassID class_id);
-void *JS_GetAnyOpaque(JSValueConst obj, JSClassID *class_id);
+void *JS_GetAnyOpaque(JSRuntime *rt, JSValueConst obj, JSClassID *class_id);
 
 /* 'buf' must be zero terminated i.e. buf[buf_len] = '\0'. */
 JSValue JS_ParseJSON(JSContext *ctx, const char *buf, size_t buf_len,
