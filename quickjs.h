@@ -66,6 +66,8 @@ typedef uint32_t JSAtom;
 #define JS_LIMB_BITS 32
 #endif
 
+#define JS_SHORT_BIG_INT_BITS 32
+    
 enum {
     /* all tags with a reference count are negative */
     JS_TAG_FIRST       = -9, /* first negative tag */
@@ -84,7 +86,8 @@ enum {
     JS_TAG_UNINITIALIZED = 4,
     JS_TAG_CATCH_OFFSET = 5,
     JS_TAG_EXCEPTION   = 6,
-    JS_TAG_FLOAT64     = 7,
+    JS_TAG_SHORT_BIG_INT = 7,
+    JS_TAG_FLOAT64     = 8,
     /* any larger tag is FLOAT64 if JS_NAN_BOXING */
 };
 
@@ -101,10 +104,19 @@ typedef uint64_t JSValue;
 #define JS_VALUE_GET_TAG(v) (int)((v) >> 32)
 #define JS_VALUE_GET_INT(v) (int)(v)
 #define JS_VALUE_GET_BOOL(v) (int)(v)
+#define JS_VALUE_GET_SHORT_BIG_INT(v) (int)(v)
+#ifdef JS_PTR64
 #define JS_VALUE_GET_PTR(v) (void *)((intptr_t)rt + (int)(v))
+#else
+#define JS_VALUE_GET_PTR(v) (void *)(intptr_t)(v)
+#endif
 
 #define JS_MKVAL(tag, val) (((uint64_t)(tag) << 32) | (uint32_t)(val))
+#ifdef JS_PTR64
 #define JS_MKPTR(tag, ptr) (((uint64_t)(tag) << 32) | ((intptr_t)(ptr) - (intptr_t)rt))
+#else
+#define JS_MKPTR(tag, ptr) (((uint64_t)(tag) << 32) | (uintptr_t)(ptr))
+#endif
 
 #define JS_FLOAT64_TAG_ADDEND (0x7ff80000 - JS_TAG_FIRST + 1) /* quiet NaN encoding */
 
@@ -155,6 +167,11 @@ static inline JS_BOOL JS_VALUE_IS_NAN(JSValue v)
     uint32_t tag;
     tag = JS_VALUE_GET_TAG(v);
     return tag == (JS_NAN >> 32);
+}
+
+static inline JSValue __JS_NewShortBigInt(JSContext *ctx, int32_t d)
+{
+    return JS_MKVAL(JS_TAG_SHORT_BIG_INT, d);
 }
 
 #define JS_VALUE_IS_BOTH_INT(v1, v2) ((JS_VALUE_GET_TAG(v1) | JS_VALUE_GET_TAG(v2)) == 0)
@@ -497,7 +514,7 @@ static inline JS_BOOL JS_IsNumber(JSValueConst v)
 static inline JS_BOOL JS_IsBigInt(JSContext *ctx, JSValueConst v)
 {
     int tag = JS_VALUE_GET_TAG(v);
-    return tag == JS_TAG_BIG_INT;
+    return tag == JS_TAG_BIG_INT || tag == JS_TAG_SHORT_BIG_INT;
 }
 
 static inline JS_BOOL JS_IsBool(JSValueConst v)
