@@ -33,9 +33,11 @@
 #include <fenv.h>
 #include <math.h>
 #if defined(__APPLE__)
+#include <unistd.h>
 #include <sys/mman.h>
 #include <malloc/malloc.h>
 #elif defined(__linux__) || defined(__GLIBC__)
+#include <unistd.h>
 #include <malloc.h>
 #elif defined(__FreeBSD__)
 #include <malloc_np.h>
@@ -47,6 +49,7 @@
 #include "libregexp.h"
 #include "libunicode.h"
 #include "dtoa.h"
+#include "codegen.h"
 
 #define OPTIMIZE         1
 #define SHORT_OPCODES    1
@@ -91,13 +94,13 @@
   32: dump line number table
   64: dump compute_stack_size
  */
-//#define DUMP_BYTECODE  (1)
+#define DUMP_BYTECODE  (1)
 /* dump the occurence of the automatic GC */
 //#define DUMP_GC
 /* dump objects freed by the garbage collector */
 //#define DUMP_GC_FREE
 /* dump objects leaking when freeing the runtime */
-//#define DUMP_LEAKS  1
+#define DUMP_LEAKS  1
 /* dump memory usage before running the garbage collector */
 //#define DUMP_MEM
 //#define DUMP_OBJECTS    /* dump objects in JS_FreeContext */
@@ -351,6 +354,9 @@ typedef struct JSStackFrame {
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
+
+    /* only used in jit code */
+    JSValue *sp;
 } JSStackFrame;
 
 typedef enum {
@@ -647,7 +653,9 @@ typedef struct JSFunctionBytecode {
     uint8_t has_debug : 1;
     uint8_t read_only_bytecode : 1;
     uint8_t is_direct_or_indirect_eval : 1; /* used by JS_GetScriptOrModuleName() */
+    uint8_t jited: 1;
     /* XXX: 10 bits available */
+    void *jit_code;
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -1385,11 +1393,6 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
     }
 }
 
-static size_t js_malloc_usable_size_unknown(const void *ptr)
-{
-    return 0;
-}
-
 void *js_malloc_rt(JSRuntime *rt, size_t size)
 {
     return rt->mf.js_malloc(&rt->malloc_state, size);
@@ -1407,7 +1410,7 @@ void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
 
 size_t js_malloc_usable_size_rt(JSRuntime *rt, const void *ptr)
 {
-    return rt->mf.js_malloc_usable_size(ptr);
+    return rt->mf.js_malloc_usable_size(&rt->malloc_state, ptr);
 }
 
 void *js_mallocz_rt(JSRuntime *rt, size_t size)
@@ -1656,42 +1659,149 @@ static inline BOOL js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
 }
 #endif
 
-#undef MALLOC_OVERHEAD
-#define MALLOC_OVERHEAD 8
+#define LARGE_PAGE_OBJECT_SIZE (16*1024)
 
-static size_t buddy_malloc_usable_size(const void *ptr)
+typedef struct JSChunkInfo {
+    struct JSChunkInfo *next;
+    size_t size;
+} JSChunkInfo;
+
+typedef struct JSPageInfo {
+    struct JSPageInfo *next;
+    void *first_free_blk;
+    int bucket;
+} JSPageInfo;
+
+JSPageInfo* get_page_info(const void *ptr) {
+    intptr_t m = ((intptr_t)ptr & ~(LARGE_PAGE_OBJECT_SIZE - 1)) + LARGE_PAGE_OBJECT_SIZE - sizeof(JSPageInfo);
+    return (JSPageInfo*)m;
+}
+
+static size_t buddy_malloc_usable_size(JSMallocState *s, const void *ptr)
 {
+    static_assert(LARGE_PAGE_OBJECT_SIZE < (8 << (sizeof(s->first_free_page) / sizeof(s->first_free_page[0]))), "first_free_page too small");
     if (ptr) {
-        return *(int*)((char*)ptr - MALLOC_OVERHEAD);
+        size_t offset = (char*)ptr - (char*)s->opaque;
+        if (offset < s->upward_mark) {
+            JSPageInfo *page = get_page_info(ptr);
+            return 8 << page->bucket;
+        }
+        struct JSChunkInfo *p = (struct JSChunkInfo*)ptr - 1;
+        return p->size - sizeof(struct JSChunkInfo);
     }
     return 0;
 }
 
-static void *buddy_malloc(JSMallocState *s, size_t size)
+static void *buddy_malloc_large(JSMallocState *s, size_t size)
 {
-    char *ptr;
-    int chunk_size = ((size + 7) & ~7) + MALLOC_OVERHEAD;
+    static size_t g_pgmsk = 0;
+    if (g_pgmsk == 0) {
+#ifndef _WIN32
+        g_pgmsk = getpagesize() - 1;
+#else
+        SYSTEM_INFO system_info;
+        GetSystemInfo(&system_info);
+        g_pgmsk = system_info.dwPageSize -1;
+#endif
+    }
+    size = (sizeof(struct JSChunkInfo) + size + g_pgmsk) & ~g_pgmsk;
+    struct JSChunkInfo **pp = &s->first_free_chunk;
+    struct JSChunkInfo **best = NULL;
+    while (*pp) {
+        struct JSChunkInfo *p = *pp;
+        if (p->size == size) {
+            *pp = p->next;
+            return p + 1;
+        }
+        if (p->size > size) {
+            if (!best || p->size < (*best)->size) {
+                best = pp;
+            }
+        }
+        pp = &p->next;
+    }
+    if (best) {
+         struct JSChunkInfo *p = *best;
+         *best = p->next;
+         return p + 1;
+    }
 
-    if (unlikely(s->malloc_size + chunk_size > s->malloc_limit))
+    size_t alloc = s->downward_mark - size;
+    if (unlikely(s->upward_mark >= alloc))
         return NULL;
 
-    int idx = 28 - clz32(chunk_size);
-    if ((chunk_size & (chunk_size - 1)) != 0) {
+    s->downward_mark = alloc;
+    int rc = mprotect(s->opaque + alloc, size, PROT_READ|PROT_WRITE);
+    (void) rc;
+    // fprintf(stderr, "mprotect(%p - %p, %zu) -> %d (%s)\n", (char*)s->opaque + alloc, (char*)s->opaque + alloc + size, size, rc, strerror(errno));
+
+    struct JSChunkInfo *p = (struct JSChunkInfo*)((char*)s->opaque + alloc);
+    p->next = NULL;
+    p->size = size;
+
+    s->malloc_count++;
+    s->malloc_size += size;
+    return p + 1;
+}
+
+static void *buddy_malloc_small(JSMallocState *s, size_t size)
+{
+    size = ((size + 7) & ~7);
+
+    int idx = 28 - clz32(size);
+    if ((size & (size - 1)) != 0) {
         idx++;
     }
-    int actual_size = (8 << idx) - MALLOC_OVERHEAD;
-    ptr = s->firstfree[idx];
-    if (ptr) {
-        s->firstfree[idx] = *(void **)ptr;
-        *(int*)ptr = actual_size;
-    } else {
-        ptr = (char*)s->opaque + s->malloc_size;
-        *(int*)ptr = actual_size;
 
-        s->malloc_count++;
-        s->malloc_size += (8 << idx);
+    JSPageInfo *info = s->first_free_page[idx];
+    if (info) {
+        void *blk = info->first_free_blk;
+        void *next_free = *(void **)blk;
+        info->first_free_blk = next_free;
+        if (!next_free) {
+            s->first_free_page[idx] = info->next;
+        }
+        return blk;
     }
-    return ptr + MALLOC_OVERHEAD;
+
+    size_t alloc = s->upward_mark;
+    size_t new_upward_mark = alloc + LARGE_PAGE_OBJECT_SIZE;
+    if (unlikely(new_upward_mark >= s->downward_mark))
+        return NULL;
+
+    s->upward_mark = new_upward_mark;
+    mprotect(s->opaque, new_upward_mark, PROT_READ|PROT_WRITE);
+
+    size_t blksz = 8 << idx;
+    char *ptr = (char*)s->opaque + alloc;
+    info = (JSPageInfo*)((char*)s->opaque + new_upward_mark - sizeof(JSPageInfo));
+    info->next = NULL;
+    info->first_free_blk = NULL;
+    info->bucket = idx;
+    if (LARGE_PAGE_OBJECT_SIZE / blksz >= 2) {
+        s->first_free_page[idx] = info;
+
+        void **pptr = &info->first_free_blk;
+        char *next = ptr + blksz;
+        while (next + blksz <= (char*)info) {
+            *pptr = next;
+            pptr = (void**)next;
+            next += blksz;
+        }
+        *pptr = NULL;
+    }
+
+    s->malloc_count++;
+    s->malloc_size += LARGE_PAGE_OBJECT_SIZE;
+    return ptr;
+}
+
+static void *buddy_malloc(JSMallocState *s, size_t size)
+{
+    if (size >= LARGE_PAGE_OBJECT_SIZE) {
+        return buddy_malloc_large(s, size);
+    }
+    return buddy_malloc_small(s, size);
 }
 
 static void buddy_free(JSMallocState *s, void *ptr)
@@ -1699,24 +1809,37 @@ static void buddy_free(JSMallocState *s, void *ptr)
     if (!ptr)
         return;
 
-    char *m = (char*)ptr - MALLOC_OVERHEAD;
-    int idx = 28 - clz32(*(int*)m + MALLOC_OVERHEAD);
-
-    void *h = s->firstfree[idx];
-    *(void **)m = h;
-    s->firstfree[idx] = m;
+    size_t offset = (char*)ptr - (char*)s->opaque;
+    if (offset < s->upward_mark) {
+        JSPageInfo *info = get_page_info(ptr);
+        void *next_free = info->first_free_blk;
+        *(void **)ptr = next_free;
+        info->first_free_blk = ptr;
+        if (!next_free) {
+            int idx = info->bucket;
+            info->next = s->first_free_page[idx];
+            s->first_free_page[idx] = info;
+        }
+    } else {
+        struct JSChunkInfo *p = (struct JSChunkInfo*)ptr - 1;
+        struct JSChunkInfo **pp = &s->first_free_chunk;
+        while (*pp && (uintptr_t)*pp < (uintptr_t)p) {
+            pp = &(*pp)->next;
+        }
+        p->next = *pp;
+        *pp = p;
+    }
 }
 
 static void *buddy_realloc(JSMallocState *s, void *ptr, size_t size)
 {
-    size_t old_size;
-
     if (!ptr) {
         if (size == 0)
             return NULL;
         return buddy_malloc(s, size);
     }
-    old_size = buddy_malloc_usable_size(ptr);
+
+    size_t old_size = buddy_malloc_usable_size(s, ptr);
     if (size == 0) {
         buddy_free(s, ptr);
         return NULL;
@@ -1733,24 +1856,43 @@ static void *buddy_realloc(JSMallocState *s, void *ptr, size_t size)
     return alloc;
 }
 
+#define MEMORY_SIZE 128*1024*1024
+
 JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 {
-    JSRuntime *rt;
-    void *m = mmap(NULL, 64*1024*1024, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
-    if (!m)
+    JSMallocState tmpms;
+    memset(&tmpms, 0, sizeof(tmpms));
+    tmpms.downward_mark = MEMORY_SIZE;
+    tmpms.malloc_limit = MEMORY_SIZE;
+    tmpms.opaque = mmap(NULL, MEMORY_SIZE, PROT_NONE, MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE, -1, 0);
+    if (!tmpms.opaque || tmpms.opaque == MAP_FAILED)
         return NULL;
 
-    rt = m;
+    JSRuntime *rt = buddy_malloc(&tmpms, sizeof(*rt));
     memset(rt, 0, sizeof(*rt));
+
     rt->mf.js_malloc = buddy_malloc;
     rt->mf.js_malloc_usable_size = buddy_malloc_usable_size;
     rt->mf.js_free = buddy_free;
     rt->mf.js_realloc = buddy_realloc;
+    rt->malloc_state = tmpms;
     rt->malloc_gc_threshold = 256 * 1024;
-    rt->malloc_state.malloc_count = 1;
-    rt->malloc_state.malloc_size = (sizeof(*rt) + 7) & ~7;
-    rt->malloc_state.malloc_limit = 64*1024*1024;
-    rt->malloc_state.opaque = m;
+
+    /*void *m1 = buddy_malloc_large(&rt->malloc_state, 100*1024);
+    void *m2 = buddy_malloc_large(&rt->malloc_state, 200*1024);
+    void *m3 = buddy_malloc_large(&rt->malloc_state, 300*1024);
+    buddy_free(&rt->malloc_state, m2);
+    buddy_free(&rt->malloc_state, m1);
+    buddy_free(&rt->malloc_state, m3);
+
+    m2 = buddy_malloc_large(&rt->malloc_state, 200*1024);
+    buddy_free(&rt->malloc_state, m2);
+
+    m2 = buddy_malloc_large(&rt->malloc_state, 199*1024);
+    buddy_free(&rt->malloc_state, m2);
+
+    m1 = buddy_malloc_large(&rt->malloc_state, 99*1024);
+    buddy_free(&rt->malloc_state, m1);*/
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
@@ -1804,7 +1946,7 @@ void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque)
 }
 
 /* default memory allocation functions with memory limitation */
-static size_t js_def_malloc_usable_size(const void *ptr)
+static size_t js_def_malloc_usable_size(JSMallocState *s, const void *ptr)
 {
 #if defined(__APPLE__)
     return malloc_size(ptr);
@@ -1835,7 +1977,7 @@ static void *js_def_malloc(JSMallocState *s, size_t size)
         return NULL;
 
     s->malloc_count++;
-    s->malloc_size += js_def_malloc_usable_size(ptr) + MALLOC_OVERHEAD;
+    s->malloc_size += js_def_malloc_usable_size(s, ptr) + MALLOC_OVERHEAD;
     return ptr;
 }
 
@@ -1845,7 +1987,7 @@ static void js_def_free(JSMallocState *s, void *ptr)
         return;
 
     s->malloc_count--;
-    s->malloc_size -= js_def_malloc_usable_size(ptr) + MALLOC_OVERHEAD;
+    s->malloc_size -= js_def_malloc_usable_size(s, ptr) + MALLOC_OVERHEAD;
     free(ptr);
 }
 
@@ -1858,7 +2000,7 @@ static void *js_def_realloc(JSMallocState *s, void *ptr, size_t size)
             return NULL;
         return js_def_malloc(s, size);
     }
-    old_size = js_def_malloc_usable_size(ptr);
+    old_size = js_def_malloc_usable_size(s, ptr);
     if (size == 0) {
         s->malloc_count--;
         s->malloc_size -= old_size + MALLOC_OVERHEAD;
@@ -1872,7 +2014,7 @@ static void *js_def_realloc(JSMallocState *s, void *ptr, size_t size)
     if (!ptr)
         return NULL;
 
-    s->malloc_size += js_def_malloc_usable_size(ptr) - old_size;
+    s->malloc_size += js_def_malloc_usable_size(s, ptr) - old_size;
     return ptr;
 }
 
@@ -2245,7 +2387,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
 #endif
 
-    munmap(rt, 64*1024*1024);
+    munmap(rt, MEMORY_SIZE);
 }
 
 JSContext *JS_NewContextRaw(JSRuntime *rt)
@@ -17547,6 +17689,2946 @@ static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
     }
 }
 
+#define COMMENT(...) masm_comment(as, __VA_ARGS__)
+#define INLINE_COMMENT(...) masm_inline_comment(as, __VA_ARGS__)
+
+const int kJSContext_rt = offsetof(JSContext, rt);
+const int kJSRuntime_heap = offsetof(JSRuntime, malloc_state.opaque);
+const int kJSStackFrame_arg_buf = offsetof(JSStackFrame, arg_buf);
+const int kJSStackFrame_sp = offsetof(JSStackFrame, sp);
+
+static int add_loc_stub(JSContext *ctx, JSValue *sp, JSValue *pv) {
+    JSRuntime *rt = ctx->rt;
+    JSValue op2 = sp[-1];
+    if (likely(JS_VALUE_IS_BOTH_INT(*pv, op2))) {
+        int64_t r;
+        r = (int64_t)JS_VALUE_GET_INT(*pv) + JS_VALUE_GET_INT(op2);
+        if (unlikely((int)r != r)) {
+            *pv = __JS_NewFloat64(ctx, (double)r);
+        } else {
+            *pv = JS_NewInt32(ctx, r);
+        }
+    } else if (JS_VALUE_IS_BOTH_FLOAT(*pv, op2)) {
+        *pv = __JS_NewFloat64(ctx, JS_VALUE_GET_FLOAT64(*pv) +
+                                    JS_VALUE_GET_FLOAT64(op2));
+    } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING &&
+                JS_VALUE_GET_TAG(op2) == JS_TAG_STRING) {
+        //sf->cur_pc = pc;
+        if (JS_ConcatStringInPlace(ctx, JS_VALUE_GET_STRING(*pv), op2)) {
+            JS_FreeValue(ctx, op2);
+        } else {
+            op2 = JS_ConcatString(ctx, JS_DupValue(ctx, *pv), op2);
+            if (JS_IsException(op2))
+                goto exception;
+            set_value(ctx, pv, op2);
+        }
+    } else {
+        JSValue ops[2];
+        /* In case of exception, js_add_slow frees ops[0]
+            and ops[1], so we must duplicate *pv */
+        // sf->cur_pc = pc;
+        ops[0] = JS_DupValue(ctx, *pv);
+        ops[1] = op2;
+        if (js_add_slow(ctx, ops + 2))
+            goto exception;
+        set_value(ctx, pv, ops[0]);
+    }
+    return 0;
+exception:
+    return -1;
+}
+
+static JSValue call_internal_stub(JSContext *ctx, JSValue *sp, int call_argc) {
+    JSValue *call_argv = sp - call_argc;
+    JSValue ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
+                                JS_UNDEFINED, call_argc, call_argv, 0);
+    if (unlikely(JS_IsException(ret_val)))
+        goto exception;
+    for(int i = -1; i < call_argc; i++)
+        JS_FreeValue(ctx, call_argv[i]);
+    call_argv[-1] = ret_val;
+exception:
+    return ret_val;
+}
+
+static JSValue call_method_internal_stub(JSContext *ctx, JSValue *sp, int call_argc) {
+    JSValue *call_argv = sp - call_argc;
+    JSValue ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
+                                JS_UNDEFINED, call_argc, call_argv, 0);
+    if (unlikely(JS_IsException(ret_val)))
+        goto exception;
+    for(int i = -2; i < call_argc; i++)
+        JS_FreeValue(ctx, call_argv[i]);
+    call_argv[-2] = ret_val;
+exception:
+    return ret_val;
+}
+
+static int get_var_stub(JSContext *ctx, int throw_idx, JSValue *sp,
+                        JSStackFrame *sf) {
+    JSRuntime *rt = ctx->rt;
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    JSValue val = *p->u.func.var_refs[throw_idx >> 1]->pvalue;
+    if (unlikely(JS_IsUninitialized(val))) {
+        JSClosureVar *cv = &b->closure_var[throw_idx >> 1];
+        if (cv->is_lexical) {
+            JS_ThrowReferenceErrorUninitialized(ctx, cv->var_name);
+            return -1;
+        } else {
+            // sf->cur_pc = pc;
+            sp[0] = JS_GetPropertyInternal(ctx, ctx->global_obj, cv->var_name,
+                                           ctx->global_obj, throw_idx & 1);
+            if (JS_IsException(sp[0]))
+                return -1;
+        }
+    } else {
+        sp[0] = JS_DupValue(ctx, val);
+    }
+    return 0;
+}
+
+static int put_var_stub(JSContext *ctx, int init_idx, JSValue *sp,
+                        JSStackFrame *sf) {
+    JSRuntime *rt = ctx->rt;
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    JSVarRef *var_ref = p->u.func.var_refs[init_idx >> 1];
+    if (unlikely(JS_IsUninitialized(*var_ref->pvalue) || var_ref->is_const)) {
+        JSClosureVar *cv = &b->closure_var[init_idx >> 1];
+        if (var_ref->is_lexical) {
+            if (init_idx & 1)
+                goto put_var_ok;
+            if (JS_IsUninitialized(*var_ref->pvalue))
+                JS_ThrowReferenceErrorUninitialized(ctx, cv->var_name);
+            else
+                JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, cv->var_name);
+            goto exception;
+        } else {
+            // sf->cur_pc = pc;
+            int ret = JS_HasProperty(ctx, ctx->global_obj, cv->var_name);
+            if (ret < 0)
+                goto exception;
+            if (ret == 0 && is_strict_mode(ctx)) {
+                JS_ThrowReferenceErrorNotDefined(ctx, cv->var_name);
+                goto exception;
+            }
+            ret = JS_SetPropertyInternal(ctx, ctx->global_obj, cv->var_name,
+                                         sp[-1], ctx->global_obj,
+                                         JS_PROP_THROW_STRICT);
+            if (ret < 0)
+                goto exception;
+        }
+    } else {
+    put_var_ok:
+        set_value(ctx, var_ref->pvalue, sp[-1]);
+    }
+    return 0;
+exception:
+    return -1;
+}
+
+static int get_field_stub(JSContext *ctx, JSValue *sp, JSAtom atom, int keep) {
+  JSRuntime *rt = ctx->rt;
+  JSValue val, obj;
+  JSObject *p;
+  JSProperty *pr;
+  JSShapeProperty *prs;
+
+  obj = sp[-1];
+  if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+    p = JS_VALUE_GET_OBJ(obj);
+    for (;;) {
+      prs = find_own_property(&pr, p, atom);
+      if (prs) {
+        /* found */
+        if (unlikely(prs->flags & JS_PROP_TMASK))
+          goto slow_path;
+        val = JS_DupValue(ctx, pr->u.value);
+        break;
+      }
+      if (unlikely(p->is_exotic)) {
+        /* XXX: should avoid the slow path for arrays
+            and typed arrays by ensuring that 'prop' is
+            not numeric */
+        obj = JS_MKPTR(JS_TAG_OBJECT, p);
+        goto slow_path;
+      }
+      p = p->shape->proto;
+      if (!p) {
+        val = JS_UNDEFINED;
+        break;
+      }
+    }
+  } else {
+  slow_path:
+    // sf->cur_pc = pc;
+    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], 0);
+    if (unlikely(JS_IsException(val)))
+      return -1;
+  }
+  if (keep) {
+    *sp = val;
+  } else {
+    JS_FreeValue(ctx, sp[-1]);
+    sp[-1] = val;
+  }
+  return 0;
+}
+
+static int put_field_stub(JSContext *ctx, JSValue *sp, JSAtom atom) {
+    JSRuntime *rt = ctx->rt;
+    int ret;
+    JSValue obj;
+    JSObject *p;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+
+    obj = sp[-2];
+    if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        prs = find_own_property(&pr, p, atom);
+        if (!prs)
+            goto put_field_slow_path;
+        if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
+                                    JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
+            /* fast path */
+            set_value(ctx, &pr->u.value, sp[-1]);
+        } else {
+            goto put_field_slow_path;
+        }
+        JS_FreeValue(ctx, obj);
+    } else {
+    put_field_slow_path:
+        // sf->cur_pc = pc;
+        ret = JS_SetPropertyInternal(ctx, obj, atom, sp[-1], obj,
+                                        JS_PROP_THROW_STRICT);
+        JS_FreeValue(ctx, obj);
+        if (unlikely(ret < 0))
+            return -1;
+    }
+    return 0;
+}
+
+static JSValue fclosure_stub(JSContext *ctx, JSStackFrame *sf, int idx) {
+    JSRuntime *rt = ctx->rt;
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    JSValue bfunc = JS_DupValue(ctx, b->cpool[idx]);
+    return js_closure(ctx, bfunc, p->u.func.var_refs, sf, FALSE);
+}
+
+static BOOL is_if_xxx(int opcode) {
+  return opcode == OP_if_false
+#if SHORT_OPCODES
+         || opcode == OP_if_false8 || opcode == OP_if_true8
+#endif
+         || opcode == OP_if_true;
+}
+
+static uint16_t* get_jump_targets(JSContext *ctx, JSFunctionBytecode *b);
+
+void compile(JSRuntime *rt, JSValueConst func_obj) {
+  JSObject *p = JS_VALUE_GET_OBJ(func_obj);
+  JSFunctionBytecode *b = p->u.func.function_bytecode;
+  JSVarRef **var_refs = p->u.func.var_refs;
+  JSContext *ctx = b->realm;
+  uint16_t* labels = get_jump_targets(ctx, b);
+  
+  char buf[ATOM_GET_STR_BUF_SIZE];
+  const char *func_name = JS_AtomGetStr(ctx, buf, sizeof(buf), b->func_name);
+  fprintf(stderr, "\n\nfunction: %s  bytecode %p - %p %u bytes...\n", func_name,
+          b, b->byte_code_buf, (int)b->byte_code_len);
+
+  masm_t as = masm_new();
+  struct {
+  masm_label_t push_dup, dup,
+    get_var, put_var_ref, put_var,
+    get_loc_check,
+    get_field, get_field2, put_field,
+    drop,
+    add, add_loc, add_const, sub, sub_const, mul, mul_const, post_inc, post_dec,
+    div, mod, pow, plus, neg, inc, dec, lnot, not, shl, shr, sar, and, or, xor,
+    lt[4], relational_slow, cmp_const[4], goto_if[10],
+    strict_eq, strict_neq, strict_eq_slow, eq, neq, eq_slow, eq_const[2], strict_eq_const[2],
+    call, call_method,
+    fclosure, object,
+    pop_bool,
+    free_value,
+    throw_uninit,
+    exception,
+    done;
+  } go = {0};
+  masm_prolog(as);
+  for (int i = 0; i < b->byte_code_len; i++) {
+    if (labels[i]) {
+      labels[i] = masm_new_label(as, NULL);
+    }
+  }
+  go.exception = masm_new_label(as, "exception");
+  go.done = masm_new_label(as, "done");
+  for (const uint8_t *pc = b->byte_code_buf;
+       pc < b->byte_code_buf + b->byte_code_len;) {
+    int64_t imm64;
+    int32_t imm32 = pc - b->byte_code_buf;
+    int call_argc;
+    int opcode = *pc++;
+    if (labels[imm32]) {
+        masm_bind(as, labels[imm32]);
+    }
+    switch (opcode) {
+    case OP_push_i32:
+      imm32 = get_u32(pc);
+      pc += 4;
+      COMMENT("push %d", imm32);
+      imm64 = JS_NewInt32(ctx, imm32);
+    emit_imm64:
+      opcode = *pc; // next opcode
+      if (opcode == OP_set_loc) {
+        imm32 = get_u16(pc);
+        pc += 3;
+        COMMENT("& set_loc %d", imm32);
+        masm_mov_reg_imm64(as, kArg1Reg, imm64);
+        goto set_loc;
+      }
+      if (opcode == OP_put_loc) {
+        imm32 = get_u16(pc);
+        pc += 3;
+emit_put_loc_imm:;
+        COMMENT("& put_loc %d", imm32);
+        INLINE_COMMENT("old_value = varbuf[idx]");
+        masm_ldr(as, kArg2Reg, kVarBufReg, imm32 * 8);
+        INLINE_COMMENT("varbuf[idx] = imm");
+        masm_str_imm64(as, imm64, kVarBufReg, imm32 * 8);
+        goto put_free_value;
+      }
+      if (opcode == OP_add) {
+        pc += 1;
+        COMMENT("& add");
+        if (!go.add_const) go.add_const = masm_new_label(as, "add_const_thunk");
+        masm_mov_reg_imm32(as, kArg2Reg, imm64);
+        masm_call(as, go.add_const);
+        break;
+      }
+      if (opcode == OP_sub) {
+        pc += 1;
+        COMMENT("& sub");
+        if (!go.sub_const) go.sub_const = masm_new_label(as, "sub_const_thunk");
+        masm_mov_reg_imm32(as, kArg2Reg, imm64);
+        masm_call(as, go.sub_const);
+        break;
+      }
+      if (opcode == OP_mul) {
+        pc += 1;
+        COMMENT("& mul");
+        if (!go.mul_const) go.mul_const = masm_new_label(as, "mul_const_thunk");
+        masm_mov_reg_imm32(as, kArg2Reg, imm64);
+        masm_call(as, go.mul_const);
+        break;
+      }
+      if (opcode == OP_return) {
+        pc += 1;
+        COMMENT("& return");
+        masm_mov_reg_imm64(as, kRetReg, imm64);
+        masm_jmp(as, go.done);
+        break;
+      }
+      if ((opcode == OP_lt || opcode == OP_lte || opcode == OP_gt || opcode == OP_gte) && is_if_xxx(pc[1])) {
+        COMMENT("& %s & if_xx", opcode == OP_lt ? "lt" : opcode == OP_lte ? "lte" : opcode == OP_gt ? "gt" : "gte");
+        if (!go.cmp_const[opcode - OP_lt]) go.cmp_const[opcode - OP_lt] = masm_new_label(as, NULL);
+        masm_mov_reg_imm32(as, kArg2Reg, imm64);
+        masm_call(as, go.cmp_const[opcode - OP_lt]);
+        BOOL if_false = FALSE;
+#if SHORT_OPCODES
+        if (pc[1] == OP_if_false8) {
+            imm32 = (pc + 2 - b->byte_code_buf) + (int8_t)pc[2];
+            pc += 3;
+            if_false = TRUE;
+        } else if (pc[1] == OP_if_true8) {
+            imm32 = (pc + 2 - b->byte_code_buf) + (int8_t)pc[2];
+            pc += 3;
+        } else
+#endif
+        if (pc[1] == OP_if_false) {
+            imm32 = (pc + 2 - b->byte_code_buf) + (int32_t)get_u32(pc + 2);
+            pc += 6;
+            if_false = TRUE;
+        } else if (pc[1] == OP_if_true) {
+            imm32 = (pc + 2 - b->byte_code_buf) + (int8_t)pc[2];
+            pc += 3;
+        }
+        if (if_false) {
+            masm_cbz32(as, kRetReg, labels[imm32]);
+        } else {
+            masm_cbnz32(as, kRetReg, labels[imm32]);
+        }
+        break;
+      }
+      if ((opcode == OP_eq || opcode == OP_neq || opcode == OP_strict_eq || opcode == OP_strict_neq) && is_if_xxx(pc[1])) {
+        COMMENT("& %s & if_xx", opcode == OP_eq ? "eq" : opcode == OP_neq ? "neq" : opcode == OP_strict_eq ? "strict_eq" : "strict_neq");
+        if (!go.eq_const[opcode - OP_eq]) go.eq_const[opcode - OP_eq] = masm_new_label(as, NULL);
+        masm_mov_reg_imm32(as, kArg2Reg, imm64);
+        masm_call(as, go.eq_const[opcode - OP_eq]);
+#if SHORT_OPCODES
+        if (pc[1] == OP_if_false8) {
+            imm32 = (pc + 2 - b->byte_code_buf) + (int8_t)pc[2];
+            pc += 3;
+            switch (opcode) {
+            case OP_eq: opcode = OP_neq; break;
+            case OP_neq: opcode = OP_eq; break;
+            case OP_strict_eq: opcode = OP_strict_neq; break;
+            case OP_strict_neq: opcode = OP_strict_eq; break;
+            }
+        } else if (pc[1] == OP_if_true8) {
+            imm32 = (pc + 2 - b->byte_code_buf) + (int8_t)pc[2];
+            pc += 3;
+        } else
+#endif
+        if (pc[1] == OP_if_false) {
+            imm32 = (pc + 2 - b->byte_code_buf) + (int32_t)get_u32(pc + 2);
+            pc += 6;
+            switch (opcode) {
+            case OP_eq: opcode = OP_neq; break;
+            case OP_neq: opcode = OP_eq; break;
+            case OP_strict_eq: opcode = OP_strict_neq; break;
+            case OP_strict_neq: opcode = OP_strict_eq; break;
+            }
+        } else if (pc[1] == OP_if_true) {
+            imm32 = (pc + 2 - b->byte_code_buf) + (int8_t)pc[2];
+            pc += 3;
+        }
+        if (opcode == OP_eq || opcode == OP_strict_eq) {
+            masm_b_eq(as, labels[imm32]);
+        } else {
+            masm_b_ne(as, labels[imm32]);
+        }
+        break;
+      }
+#if SHORT_OPCODES
+      if (opcode == OP_set_loc8) {
+        imm32 = pc[1];
+        pc += 2;
+        COMMENT("&set_loc %d", imm32);
+        masm_mov_reg_imm64(as, kArg1Reg, imm64);
+        goto set_loc;
+      }
+      if (opcode == OP_set_loc0 || opcode == OP_set_loc1 || opcode == OP_set_loc2 || opcode == OP_set_loc3) {
+        imm32 = pc[0] - OP_set_loc0;
+        pc += 1;
+        COMMENT("&set_loc %d", imm32);
+        masm_mov_reg_imm64(as, kArg1Reg, imm64);
+        goto set_loc;
+      }
+      if (opcode == OP_put_loc8) {
+        imm32 = pc[1];
+        pc += 2;
+        goto emit_put_loc_imm;
+      }
+      if (opcode == OP_put_loc0 || opcode == OP_put_loc1 || opcode == OP_put_loc2 || opcode == OP_put_loc3) {
+        imm32 = pc[0] - OP_put_loc0;
+        pc += 1;
+        goto emit_put_loc_imm;
+      }
+#endif
+      masm_push_imm64(as, imm64);
+      break;
+    case OP_push_bigint_i32:
+      imm32 = get_u32(pc);
+      pc += 4;
+      COMMENT("push_bigint %d", imm32);
+      imm64 = __JS_NewShortBigInt(ctx, imm32);
+      pc += 4;
+      masm_push_imm64(as, imm64);
+      break;
+    case OP_push_const:
+      imm32 = get_u32(pc);
+      pc += 4;
+    emit_push_const:
+      COMMENT("push_const b->cpool[%d]", imm32);
+      imm64 = b->cpool[imm32];
+      if (JS_VALUE_HAS_REF_COUNT(imm64)) {
+        masm_mov_reg_imm32(as, kArg1Reg, (int32_t)imm64);
+        INLINE_COMMENT("ref_count++");
+        masm_inc32_rtmem(as, kArg1Reg);
+      }
+      masm_push_imm64(as, imm64);
+      break;
+#if SHORT_OPCODES
+    case OP_push_minus1:
+    case OP_push_0:
+    case OP_push_1:
+    case OP_push_2:
+    case OP_push_3:
+    case OP_push_4:
+    case OP_push_5:
+    case OP_push_6:
+    case OP_push_7:
+      COMMENT("push %d", opcode - OP_push_0);
+      imm64 = JS_NewInt32(ctx, opcode - OP_push_0);
+      goto emit_imm64;
+    case OP_push_i8:
+      COMMENT("push %d", get_i8(pc));
+      imm64 = JS_NewInt32(ctx, get_i8(pc));
+      pc += 1;
+      goto emit_imm64;
+    case OP_push_i16:
+      COMMENT("push %d", get_i16(pc));
+      imm64 = JS_NewInt32(ctx, get_i16(pc));
+      pc += 2;
+      goto emit_imm64;
+    case OP_push_const8:
+      imm32 = *pc++;
+      goto emit_push_const;
+    case OP_fclosure8:
+      imm32 = *pc++;
+      goto emit_fclosure;
+    case OP_push_empty_string:
+      COMMENT("push_empty_string");
+      imm64 = JS_AtomToValue(ctx, JS_ATOM_empty_string);
+    emit_push_string:
+      JS_FreeValue(ctx, imm64);
+      masm_mov_reg_imm64(as, kArg1Reg, imm64);
+      if (!go.push_dup) go.push_dup = masm_new_label(as, "push_dup_thunk");
+      masm_call(as, go.push_dup);
+      break;
+#endif
+    case OP_push_atom_value:
+      imm32 = get_u32(pc);
+      pc += 4;
+      COMMENT("push_atom_value %d", imm32);
+      if (__JS_AtomIsTaggedInt(imm32)) {
+        masm_push_c_arg_imm64(as, 2, imm32);
+        masm_push_c_arg_reg(as, 1, kCtxReg);
+        masm_call_stub(as, JS_AtomToValue, 0);
+        masm_push_reg(as, kRetReg);
+      } else {
+        INLINE_COMMENT(JS_AtomGetStr(ctx, buf, sizeof(buf), imm32));
+        imm64 = JS_AtomToValue(ctx, imm32);
+        goto emit_push_string;
+      }
+      break;
+    case OP_undefined:
+      COMMENT("*sp++ = JS_UNDEFINED");
+      imm64 = JS_UNDEFINED;
+      masm_push_imm64(as, imm64);
+      break;
+    case OP_null:
+      COMMENT("*sp++ = JS_NULL");
+      imm64 = JS_NULL;
+      masm_push_imm64(as, imm64);
+      break;
+    case OP_push_this:
+      /* OP_push_this is only called at the start of a function */
+      //   {
+      //       JSValue val;
+      //       if (!(b->js_mode & JS_MODE_STRICT)) {
+      //           uint32_t tag = JS_VALUE_GET_TAG(this_obj);
+      //           if (likely(tag == JS_TAG_OBJECT))
+      //               goto normal_this;
+      //           if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
+      //               val = JS_DupValue(ctx, ctx->global_obj);
+      //           } else {
+      //               val = JS_ToObject(ctx, this_obj);
+      //               if (JS_IsException(val))
+      //                   goto exception;
+      //           }
+      //       } else {
+      //       normal_this:
+      //           val = JS_DupValue(ctx, this_obj);
+      //       }
+      //       *sp++ = val;
+      //   }
+      assert(0);
+      break;
+    case OP_push_false:
+      COMMENT("*sp++ = JS_FALSE");
+      imm64 = JS_FALSE;
+      masm_push_imm64(as, imm64);
+      break;
+    case OP_push_true:
+      COMMENT("*sp++ = JS_TRUE");
+      imm64 = JS_TRUE;
+      masm_push_imm64(as, imm64);
+      break;
+    case OP_object:
+      COMMENT("object");
+      if (!go.object) go.object = masm_new_label(as, "object_thunk");
+      masm_call(as, go.object);
+      break;
+    case OP_special_object:
+      pc++;
+      assert(0);
+      break;
+    case OP_rest:
+      pc += 2;
+      assert(0);
+      break;
+
+    case OP_drop:
+      COMMENT("drop");
+      if (!go.drop) go.drop = masm_new_label(as, "drop_thunk");
+      masm_call(as, go.drop);
+      // JS_FreeValue(ctx, sp[-1]);
+      // sp--;
+      break;
+    case OP_nip:
+      // JS_FreeValue(ctx, sp[-2]);
+      // sp[-2] = sp[-1];
+      // sp--;
+      assert(0);
+      break;
+    case OP_nip1: /* a b c -> b c */
+      // JS_FreeValue(ctx, sp[-3]);
+      // sp[-3] = sp[-2];
+      // sp[-2] = sp[-1];
+      // sp--;
+      assert(0);
+      break;
+    case OP_dup:
+      // sp[0] = JS_DupValue(ctx, sp[-1]);
+      // sp++;
+      COMMENT("dup");
+      masm_ldr(as, kArg1Reg, kStkReg, -8);
+      if (!go.push_dup) go.push_dup = masm_new_label(as, "push_dup_thunk");
+      masm_call(as, go.push_dup);
+      break;
+    case OP_dup2: /* a b -> a b a b */
+      // sp[0] = JS_DupValue(ctx, sp[-2]);
+      // sp[1] = JS_DupValue(ctx, sp[-1]);
+      // sp += 2;
+      assert(0);
+      break;
+    case OP_dup3: /* a b c -> a b c a b c */
+      // sp[0] = JS_DupValue(ctx, sp[-3]);
+      // sp[1] = JS_DupValue(ctx, sp[-2]);
+      // sp[2] = JS_DupValue(ctx, sp[-1]);
+      // sp += 3;
+      assert(0);
+      break;
+    case OP_dup1: /* a b -> a a b */
+      // sp[0] = sp[-1];
+      // sp[-1] = JS_DupValue(ctx, sp[-2]);
+      // sp++;
+      assert(0);
+      break;
+    case OP_insert2: /* obj a -> a obj a (dup_x1) */
+      // sp[0] = sp[-1];
+      // sp[-1] = sp[-2];
+      // sp[-2] = JS_DupValue(ctx, sp[0]);
+      // sp++;
+      assert(0);
+      break;
+    case OP_insert3: /* obj prop a -> a obj prop a (dup_x2) */
+      // sp[0] = sp[-1];
+      // sp[-1] = sp[-2];
+      // sp[-2] = sp[-3];
+      // sp[-3] = JS_DupValue(ctx, sp[0]);
+      // sp++;
+      assert(0);
+      break;
+    case OP_insert4: /* this obj prop a -> a this obj prop a */
+      // sp[0] = sp[-1];
+      // sp[-1] = sp[-2];
+      // sp[-2] = sp[-3];
+      // sp[-3] = sp[-4];
+      // sp[-4] = JS_DupValue(ctx, sp[0]);
+      // sp++;
+      assert(0);
+      break;
+    case OP_perm3: /* obj a b -> a obj b (213) */
+    {
+      // JSValue tmp;
+      // tmp = sp[-2];
+      // sp[-2] = sp[-3];
+      // sp[-3] = tmp;
+      assert(0);
+    } break;
+    case OP_rot3l: /* x a b -> a b x (231) */
+    {
+      // JSValue tmp;
+      // tmp = sp[-3];
+      // sp[-3] = sp[-2];
+      // sp[-2] = sp[-1];
+      // sp[-1] = tmp;
+      assert(0);
+    } break;
+    case OP_rot4l: /* x a b c -> a b c x */
+    {
+      // JSValue tmp;
+      // tmp = sp[-4];
+      // sp[-4] = sp[-3];
+      // sp[-3] = sp[-2];
+      // sp[-2] = sp[-1];
+      // sp[-1] = tmp;
+      assert(0);
+    } break;
+    case OP_rot5l: /* x a b c d -> a b c d x */
+    {
+      // JSValue tmp;
+      // tmp = sp[-5];
+      // sp[-5] = sp[-4];
+      // sp[-4] = sp[-3];
+      // sp[-3] = sp[-2];
+      // sp[-2] = sp[-1];
+      // sp[-1] = tmp;
+      assert(0);
+    } break;
+    case OP_rot3r: /* a b x -> x a b (312) */
+    {
+      // JSValue tmp;
+      // tmp = sp[-1];
+      // sp[-1] = sp[-2];
+      // sp[-2] = sp[-3];
+      // sp[-3] = tmp;
+      assert(0);
+    } break;
+    case OP_perm4: /* obj prop a b -> a obj prop b */
+    {
+      // JSValue tmp;
+      // tmp = sp[-2];
+      // sp[-2] = sp[-3];
+      // sp[-3] = sp[-4];
+      // sp[-4] = tmp;
+      assert(0);
+    } break;
+    case OP_perm5: /* this obj prop a b -> a this obj prop b */
+    {
+      // JSValue tmp;
+      // tmp = sp[-2];
+      // sp[-2] = sp[-3];
+      // sp[-3] = sp[-4];
+      // sp[-4] = sp[-5];
+      // sp[-5] = tmp;
+      assert(0);
+    } break;
+    case OP_swap: /* a b -> b a */
+    {
+      // JSValue tmp;
+      // tmp = sp[-2];
+      // sp[-2] = sp[-1];
+      // sp[-1] = tmp;
+      assert(0);
+    } break;
+    case OP_swap2: /* a b c d -> c d a b */
+    {
+      // JSValue tmp1, tmp2;
+      // tmp1 = sp[-4];
+      // tmp2 = sp[-3];
+      // sp[-4] = sp[-2];
+      // sp[-3] = sp[-1];
+      // sp[-2] = tmp1;
+      // sp[-1] = tmp2;
+      assert(0);
+    } break;
+
+    case OP_fclosure:
+      imm32 = get_u32(pc);
+      pc += 4;
+emit_fclosure:;
+      COMMENT("fclosure %d", imm32);
+      if (!go.fclosure) go.fclosure = masm_new_label(as, "fclosure_thunk");
+      INLINE_COMMENT(JS_AtomGetStr(ctx, buf, sizeof(buf), ((JSFunctionBytecode*)JS_VALUE_GET_PTR(b->cpool[imm32]))->func_name));
+      masm_push_c_arg_imm64(as, 3, imm32);
+      masm_call(as, go.fclosure);
+      break;
+#if SHORT_OPCODES
+    case OP_call0:
+    case OP_call1:
+    case OP_call2:
+    case OP_call3:
+      call_argc = opcode - OP_call0;
+      goto has_call_argc;
+#endif
+    case OP_call:
+    case OP_tail_call:
+      call_argc = get_u16(pc);
+      pc += 2;
+    has_call_argc:;
+      COMMENT("%s %d", opcode == OP_tail_call ? "tail_call" : "call",
+              call_argc);
+      masm_push_c_arg_imm64(as, 3, call_argc);
+      if (opcode == OP_tail_call) {
+        INLINE_COMMENT("sp");
+        masm_push_c_arg_reg(as, 2, kStkReg);
+        INLINE_COMMENT("ctx");
+        masm_push_c_arg_reg(as, 1, kCtxReg);
+        INLINE_COMMENT("call_internal_stub");
+        masm_tail_call_stub(as, call_internal_stub, go.done);
+      } else {
+        if (!go.call) go.call = masm_new_label(as, "call_thunk");
+        masm_call(as, go.call);
+        if (call_argc != 0) {
+          masm_add_reg_imm32(as, kStkReg, kStkReg, call_argc * -8);
+        }
+      }
+      break;
+    case OP_call_constructor: {
+      call_argc = get_u16(pc);
+      pc += 2;
+      assert(0);
+      /*call_argv = sp - call_argc;
+      sf->cur_pc = pc;
+      ret_val = JS_CallConstructorInternal(ctx, call_argv[-2],
+                                           call_argv[-1],
+                                           call_argc, call_argv, 0);
+      if (unlikely(JS_IsException(ret_val)))
+          goto exception;
+      for(i = -2; i < call_argc; i++)
+          JS_FreeValue(ctx, call_argv[i]);
+      sp -= call_argc + 2;
+      *sp++ = ret_val;*/
+    } break;
+    case OP_call_method:
+    case OP_tail_call_method:
+      call_argc = get_u16(pc);
+      pc += 2;
+      COMMENT("%s %d",
+              opcode == OP_tail_call_method ? "tail_call_method"
+                                            : "call_method",
+              call_argc);
+      masm_push_c_arg_imm64(as, 3, call_argc);
+      if (opcode == OP_tail_call_method) {
+        INLINE_COMMENT("sp");
+        masm_push_c_arg_reg(as, 2, kStkReg);
+        INLINE_COMMENT("ctx");
+        masm_push_c_arg_reg(as, 1, kCtxReg);
+        INLINE_COMMENT("call_method_internal_stub");
+        masm_tail_call_stub(as, call_method_internal_stub, go.done);
+      } else {
+        if (!go.call_method) go.call_method = masm_new_label(as, "call_method_thunk");
+        masm_call(as, go.call_method);
+        masm_add_reg_imm32(as, kStkReg, kStkReg, (call_argc + 1) * -8);
+      }
+      break;
+    case OP_array_from:
+      call_argc = get_u16(pc);
+      pc += 2;
+      assert(0);
+      /*ret_val = js_create_array_free(ctx, call_argc, sp - call_argc);
+      sp -= call_argc;
+      if (unlikely(JS_IsException(ret_val)))
+          goto exception;
+      *sp++ = ret_val;*/
+      break;
+
+    case OP_apply: {
+      imm32 = get_u16(pc);
+      pc += 2;
+      assert(0);
+    } break;
+    case OP_return:
+      COMMENT("return");
+      INLINE_COMMENT("ret_val = *--sp");
+      masm_pop_reg(as, kRetReg);
+      masm_jmp(as, go.done);
+      break;
+    case OP_return_undef:
+      COMMENT("return_undef");
+      masm_mov_reg_imm64(as, kRetReg, JS_UNDEFINED);
+      masm_jmp(as, go.done);
+      break;
+
+    case OP_check_ctor_return:
+      /* return TRUE if 'this' should be returned */
+      assert(0);
+      break;
+    case OP_check_ctor:
+      // if (JS_IsUndefined(new_target)) {
+      // non_ctor_call:
+      //     JS_ThrowTypeError(ctx, "class constructors must be invoked with
+      //     'new'"); goto exception;
+      // }
+      assert(0);
+      break;
+    case OP_init_ctor:
+      assert(0);
+      break;
+    case OP_check_brand:
+      assert(0);
+      break;
+    case OP_add_brand:
+      // if (JS_AddBrand(ctx, sp[-2], sp[-1]) < 0)
+      //     goto exception;
+      // JS_FreeValue(ctx, sp[-2]);
+      // JS_FreeValue(ctx, sp[-1]);
+      // sp -= 2;
+      assert(0);
+      break;
+
+    case OP_throw:
+      // JS_Throw(ctx, *--sp);
+      assert(0);
+      break;
+
+    case OP_throw_error: {
+    //   JSAtom atom;
+    //   int type;
+    //   atom = get_u32(pc);
+    //   type = pc[4];
+      pc += 5;
+      assert(0);
+    } break;
+
+    case OP_eval: {
+    //   JSValueConst obj;
+    //   int scope_idx;
+    //   call_argc = get_u16(pc);
+    //   scope_idx = get_u16(pc + 2) + ARG_SCOPE_END;
+      pc += 4;
+      assert(0);
+    } break;
+      /* could merge with OP_apply */
+    case OP_apply_eval: {
+    //   int scope_idx;
+    //   uint32_t len;
+    //   JSValue *tab;
+    //   JSValueConst obj;
+
+    //   scope_idx = get_u16(pc) + ARG_SCOPE_END;
+      pc += 2;
+      assert(0);
+    } break;
+
+    case OP_regexp: {
+      // sp[-2] = JS_NewRegexp(ctx, sp[-2], sp[-1]);
+      // sp--;
+      // if (JS_IsException(sp[-1]))
+      //     goto exception;
+      assert(0);
+    } break;
+
+    case OP_get_super: {
+      // JSValue proto;
+      // sf->cur_pc = pc;
+      // proto = JS_GetPrototype(ctx, sp[-1]);
+      // if (JS_IsException(proto))
+      //     goto exception;
+      // JS_FreeValue(ctx, sp[-1]);
+      // sp[-1] = proto;
+      assert(0);
+    } break;
+
+    case OP_import: {
+      // JSValue val;
+      // sf->cur_pc = pc;
+      // val = js_dynamic_import(ctx, sp[-2], sp[-1]);
+      // if (JS_IsException(val))
+      //     goto exception;
+      // JS_FreeValue(ctx, sp[-2]);
+      // JS_FreeValue(ctx, sp[-1]);
+      // sp--;
+      // sp[-1] = val;
+      assert(0);
+    } break;
+
+    case OP_get_var_undef:
+    case OP_get_var:
+      imm32 = get_u16(pc);
+      pc += 2;
+      if (!go.get_var) go.get_var = masm_new_label(as, "get_var_thunk");
+      COMMENT("%s %d", "get_var", imm32);
+      INLINE_COMMENT(JS_AtomGetStr(ctx, buf, sizeof(buf), b->closure_var[imm32].var_name));
+      masm_push_c_arg_imm64(as, 2, (imm32 << 1) | (opcode == OP_get_var));
+      masm_call(as, go.get_var);
+      break;
+
+    case OP_put_var_init:
+    case OP_put_var: {
+      imm32 = get_u16(pc);
+      pc += 2;
+      if (!go.put_var) go.put_var = masm_new_label(as, "put_var_thunk");
+      COMMENT("put_var %d", imm32);
+      masm_push_c_arg_imm64(as, 2, imm32 << 1 | (opcode == OP_put_var_init));
+      masm_call(as, go.put_var);
+    } break;
+    case OP_get_loc: {
+      imm32 = get_u16(pc);
+      pc += 2;
+emit_get_loc:;
+      COMMENT("get_loc %d", imm32);
+      masm_ldr(as, kArg1Reg, kVarBufReg, imm32 * 8);
+      if (!go.push_dup) go.push_dup = masm_new_label(as, "push_dup_thunk");
+      masm_call(as, go.push_dup);
+    } break;
+    case OP_put_loc: {
+      imm32 = get_u16(pc);
+      pc += 2;
+emit_put_loc:;
+      COMMENT("put_loc %d", imm32);
+      masm_pop_reg(as, kArg3Reg);
+      INLINE_COMMENT("old_value");
+      masm_ldr(as, kArg2Reg, kVarBufReg, imm32 * 8); // free_value requires
+      masm_str(as, kArg3Reg, kVarBufReg, imm32 * 8);
+
+put_free_value:;
+      if (!go.free_value) go.free_value = masm_new_label(as, "free_value_thunk");
+      masm_call(as, go.free_value);
+    } break;
+    case OP_set_loc: {
+      imm32 = get_u16(pc);
+      pc += 2;
+emit_set_loc:;
+      if (!go.dup) go.dup = masm_new_label(as, "dup_thunk");
+      COMMENT("set_loc %d", imm32);
+      masm_ldr(as, kArg1Reg, kStkReg, -8);
+      masm_call(as, go.dup);
+set_loc:;
+      INLINE_COMMENT("old_value");
+      masm_ldr(as, kArg2Reg, kVarBufReg, imm32 * 8); // free_value requires
+      masm_str(as, kArg1Reg, kVarBufReg, imm32 * 8);
+      goto put_free_value;
+    }
+    case OP_get_arg:
+      imm32 = get_u16(pc);
+      pc += 2;
+    emit_get_arg:;
+      {
+        COMMENT("get_arg %d", imm32);
+        masm_ldr(as, kArg1Reg, kArgBufReg, imm32 * 8);
+        if (!go.push_dup) go.push_dup = masm_new_label(as, "push_dup_thunk");
+        masm_call(as, go.push_dup);
+      }
+      break;
+    case OP_put_arg: {
+      imm32 = get_u16(pc);
+      pc += 2;
+emit_put_arg:;
+      COMMENT("put_arg %d", imm32);
+      masm_pop_reg(as, kArg1Reg);
+      INLINE_COMMENT("old_value");
+      masm_ldr(as, kArg2Reg, kArgBufReg, imm32 * 8); // free_value requires
+      masm_str(as, kArg1Reg, kArgBufReg, imm32 * 8);
+      goto put_free_value;
+    }
+    case OP_set_arg: {
+      imm32 = get_u16(pc);
+      pc += 2;
+emit_set_arg:;
+      COMMENT("set_arg %d", imm32);
+      if (!go.dup) go.dup = masm_new_label(as, "dup_thunk");
+      masm_ldr(as, kArg1Reg, kStkReg, -8);
+      masm_call(as, go.dup);
+      INLINE_COMMENT("old_value");
+      masm_ldr(as, kArg2Reg, kArgBufReg, imm32 * 8); // free_value requires
+      masm_str(as, kArg1Reg, kArgBufReg, imm32 * 8);
+      goto put_free_value;
+    }
+
+#if SHORT_OPCODES
+    case OP_get_loc8:
+      imm32 = *pc++;
+      goto emit_get_loc;
+    case OP_put_loc8:
+      imm32 = *pc++;
+      goto emit_put_loc;
+    case OP_set_loc8:
+      imm32 = *pc++;
+      goto emit_set_loc;
+    case OP_get_loc0:
+    case OP_get_loc1:
+    case OP_get_loc2:
+    case OP_get_loc3:
+      imm32 = opcode - OP_get_loc0;
+      goto emit_get_loc;
+    case OP_put_loc0:
+    case OP_put_loc1:
+    case OP_put_loc2:
+    case OP_put_loc3:
+      imm32 = opcode - OP_put_loc0;
+      goto emit_put_loc;
+    case OP_set_loc0:
+    case OP_set_loc1:
+    case OP_set_loc2:
+    case OP_set_loc3:
+      imm32 = opcode - OP_set_loc0;
+      goto emit_set_loc;
+    case OP_get_arg3:
+    case OP_get_arg2:
+    case OP_get_arg1:
+    case OP_get_arg0:
+      imm32 = opcode - OP_get_arg0;
+      goto emit_get_arg;
+    case OP_put_arg0:
+    case OP_put_arg1:
+    case OP_put_arg2:
+    case OP_put_arg3:
+      imm32 = opcode - OP_put_arg0;
+      goto emit_put_arg;
+    case OP_set_arg0:
+    case OP_set_arg1:
+    case OP_set_arg2:
+    case OP_set_arg3:
+      imm32 = opcode - OP_set_arg0;
+      goto emit_set_arg;
+    case OP_get_var_ref0:
+    case OP_get_var_ref1:
+    case OP_get_var_ref2:
+    case OP_get_var_ref3:
+      imm32 = opcode - OP_get_var_ref0;
+      goto emit_get_var_ref;
+    case OP_put_var_ref0:
+    case OP_put_var_ref1:
+    case OP_put_var_ref2:
+    case OP_put_var_ref3:
+      imm32 = opcode - OP_put_var_ref0;
+      goto emit_put_var_ref;
+    case OP_set_var_ref0:
+    case OP_set_var_ref1:
+    case OP_set_var_ref2:
+    case OP_set_var_ref3:
+      imm32 = opcode - OP_set_var_ref0;
+      goto emit_set_var_ref;
+#endif
+
+    case OP_get_var_ref: {
+      imm32 = get_u16(pc);
+      pc += 2;
+emit_get_var_ref:;
+      COMMENT("get_var_ref %d", imm32);
+      masm_mov_reg_imm64(as, kArg3Reg, (intptr_t)&var_refs[imm32]->pvalue - (intptr_t)rt);
+      masm_ldr2(as, kArg3Reg, kArg3Reg, kHeapReg);
+      masm_ldr(as, kArg1Reg, kArg3Reg, 0);
+      if (!go.push_dup) go.push_dup = masm_new_label(as, "push_dup_thunk");
+      masm_call(as, go.push_dup);
+    } break;
+    case OP_put_var_ref: {
+      imm32 = get_u16(pc);
+      pc += 2;
+emit_put_var_ref:;
+      COMMENT("put_var_ref %d", imm32);
+      if (!go.put_var_ref) go.put_var_ref = masm_new_label(as, "put_var_ref_thunk");
+      masm_mov_reg_imm64(as, kArg3Reg, (intptr_t)&var_refs[imm32]->pvalue - (intptr_t)rt);
+      masm_call(as, go.put_var_ref);
+    } break;
+    case OP_set_var_ref: {
+      imm32 = get_u16(pc);
+      pc += 2;
+emit_set_var_ref:;
+      COMMENT("set_var_ref %d", imm32);
+      masm_ldr(as, kArg1Reg, kStkReg, -8);
+      if (!go.dup) go.dup = masm_new_label(as, "dup_thunk");
+      masm_call(as, go.dup);
+
+      masm_mov_reg_imm64(as, kArg3Reg, (intptr_t)&var_refs[imm32]->pvalue - (intptr_t)rt);
+      masm_ldr2(as, kArg3Reg, kArg3Reg, kHeapReg);
+      masm_ldr(as, kArg2Reg, kArg3Reg, 0); // free_value requires
+      masm_str(as, kArg1Reg, kArg3Reg, 0);
+      goto put_free_value;
+    } break;
+    case OP_get_var_ref_check: {
+      imm32 = get_u16(pc);
+      pc += 2;
+      COMMENT("get_var_ref_check %d", imm32);
+      assert(0);
+      // val = *var_refs[imm32]->pvalue;
+      // if (unlikely(JS_IsUninitialized(val))) {
+      //     JS_ThrowReferenceErrorUninitialized2(ctx, b, imm32, TRUE);
+      //     goto exception;
+      // }
+      // sp[0] = JS_DupValue(ctx, val);
+      // sp++;
+    } break;
+    case OP_put_var_ref_check: {
+      imm32 = get_u16(pc);
+      pc += 2;
+      COMMENT("put_var_ref_check %d", imm32);
+      assert(0);
+      // if (unlikely(JS_IsUninitialized(*var_refs[imm32]->pvalue))) {
+      //     JS_ThrowReferenceErrorUninitialized2(ctx, b, imm32, TRUE);
+      //     goto exception;
+      // }
+      // set_value(ctx, var_refs[imm32]->pvalue, sp[-1]);
+      // sp--;
+    } break;
+    case OP_put_var_ref_check_init: {
+      imm32 = get_u16(pc);
+      pc += 2;
+      COMMENT("put_var_ref_check_init %d", imm32);
+      assert(0);
+      // if (unlikely(!JS_IsUninitialized(*var_refs[imm32]->pvalue))) {
+      //     JS_ThrowReferenceErrorUninitialized2(ctx, b, imm32, TRUE);
+      //     goto exception;
+      // }
+      // set_value(ctx, var_refs[imm32]->pvalue, sp[-1]);
+      // sp--;
+    } break;
+    case OP_set_loc_uninitialized: {
+      imm32 = get_u16(pc);
+      pc += 2;
+      COMMENT("set_loc_uninitialized %d", imm32);
+      masm_mov_reg_imm64(as, kArg1Reg, JS_UNINITIALIZED);
+      masm_str(as, kArg1Reg, kVarBufReg, imm32 * 8);
+    } break;
+    case OP_get_loc_check: {
+      if (!go.get_loc_check) go.get_loc_check = masm_new_label(as, "get_loc_check_thunk");
+      imm32 = get_u16(pc);
+      pc += 2;
+      COMMENT("get_loc_check %d", imm32);
+      INLINE_COMMENT("v = var_buf[idx]");
+      masm_ldr(as, kArg1Reg, kVarBufReg, imm32 * 8);
+      masm_call(as, go.get_loc_check);
+      // if (unlikely(JS_IsUninitialized(var_buf[imm32]))) {
+      //     JS_ThrowReferenceErrorUninitialized2(ctx, b, imm32, FALSE);
+      //     goto exception;
+      // }
+      // sp[0] = JS_DupValue(ctx, var_buf[imm32]);
+      // sp++;
+    } break;
+    case OP_get_loc_checkthis: {
+      imm32 = get_u16(pc);
+      pc += 2;
+      assert(0);
+      // if (unlikely(JS_IsUninitialized(var_buf[imm32]))) {
+      //     JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, imm32, FALSE);
+      //     goto exception;
+      // }
+      // sp[0] = JS_DupValue(ctx, var_buf[imm32]);
+      // sp++;
+    } break;
+    case OP_put_loc_check: {
+      imm32 = get_u16(pc);
+      pc += 2;
+      goto emit_put_loc;
+      // if (unlikely(JS_IsUninitialized(var_buf[imm32]))) {
+      //     JS_ThrowReferenceErrorUninitialized2(ctx, b, imm32, FALSE);
+      //     goto exception;
+      // }
+      // set_value(ctx, &var_buf[imm32], sp[-1]);
+      // sp--;
+    } break;
+    case OP_put_loc_check_init: {
+      imm32 = get_u16(pc);
+      pc += 2;
+      goto emit_put_loc;
+      // if (unlikely(!JS_IsUninitialized(var_buf[imm32]))) {
+      //     JS_ThrowReferenceError(ctx, "'this' can be initialized only
+      //     once"); goto exception;
+      // }
+      // set_value(ctx, &var_buf[imm32], sp[-1]);
+      // sp--;
+    } break;
+    case OP_close_loc: {
+      imm32 = get_u16(pc);
+      pc += 2;
+      COMMENT("close_loc %d", imm32);
+      assert(0);
+      // close_lexical_var(ctx, b, sf, imm32);
+    } break;
+
+    case OP_make_loc_ref:
+    case OP_make_arg_ref:
+    case OP_make_var_ref_ref: {
+    //   JSVarRef *var_ref;
+    //   JSProperty *pr;
+    //   JSAtom atom;
+    //   atom = get_u32(pc);
+    //   imm32 = get_u16(pc + 4);
+      pc += 6;
+      assert(0);
+    } break;
+    case OP_make_var_ref: {
+    //   JSAtom atom;
+    //   atom = get_u32(pc);
+      pc += 4;
+      assert(0);
+      // sf->cur_pc = pc;
+
+      // if (JS_GetGlobalVarRef(ctx, atom, sp))
+      //     goto exception;
+      // sp += 2;
+    } break;
+
+    case OP_goto:
+      imm32 = (pc - b->byte_code_buf) + (int32_t)get_u32(pc);
+      pc += 4;
+emit_goto:;
+      COMMENT("goto %d", imm32);
+      masm_jmp(as, labels[imm32]);
+      break;
+#if SHORT_OPCODES
+    case OP_goto16:
+      imm32 = (pc - b->byte_code_buf) + (int16_t)get_u16(pc);
+      pc += 2;
+      goto emit_goto;
+    case OP_goto8:
+      imm32 = (pc - b->byte_code_buf) + (int8_t)pc[0];
+      pc += 1;
+      goto emit_goto;
+#endif
+    case OP_if_true: {
+      imm32 = (pc - b->byte_code_buf) + (int32_t)get_u32(pc);
+      pc += 4;
+emit_if_true:;
+      COMMENT("if_true %d", imm32);
+      if (!go.pop_bool) go.pop_bool = masm_new_label(as, "pop_bool_thunk");
+      masm_call(as, go.pop_bool);
+      masm_cbnz32(as, kArg1Reg, labels[imm32]);
+    } break;
+    case OP_if_false: {
+      imm32 = (pc - b->byte_code_buf) + (int32_t)get_u32(pc);
+      pc += 4;
+emit_if_false:;
+      COMMENT("if_false %d", imm32);
+      if (!go.pop_bool) go.pop_bool = masm_new_label(as, "pop_bool_thunk");
+      masm_call(as, go.pop_bool);
+      masm_cbz32(as, kArg1Reg, labels[imm32]);
+    } break;
+#if SHORT_OPCODES
+    case OP_if_true8:
+      imm32 = (pc - b->byte_code_buf) + (int8_t)*pc;
+      pc += 1;
+      goto emit_if_true;
+    case OP_if_false8:
+      imm32 = (pc - b->byte_code_buf) + (int8_t)*pc;
+      pc += 1;
+      goto emit_if_false;
+#endif
+    case OP_catch: {
+      // int32_t diff;
+      // diff = get_u32(pc);
+      // sp[0] = JS_NewCatchOffset(ctx, pc + diff - b->byte_code_buf);
+      // sp++;
+      pc += 4;
+      assert(0);
+    } break;
+    case OP_gosub: {
+      // int32_t diff;
+      // diff = get_u32(pc);
+      /* XXX: should have a different tag to avoid security flaw */
+      // sp[0] = JS_NewInt32(ctx, pc + 4 - b->byte_code_buf);
+      // sp++;
+      // pc += diff;
+      pc += 4;
+      assert(0);
+    } break;
+    case OP_ret: {
+      // JSValue op1;
+      // uint32_t pos;
+      // op1 = sp[-1];
+      // if (unlikely(JS_VALUE_GET_TAG(op1) != JS_TAG_INT))
+      //     goto ret_fail;
+      // pos = JS_VALUE_GET_INT(op1);
+      // if (unlikely(pos >= b->byte_code_len)) {
+      // ret_fail:
+      //     JS_ThrowInternalError(ctx, "invalid ret value");
+      //     goto exception;
+      // }
+      // sp--;
+      // pc = b->byte_code_buf + pos;
+      assert(0);
+    } break;
+
+    case OP_for_in_start:
+      // sf->cur_pc = pc;
+      // if (js_for_in_start(ctx, sp))
+      //     goto exception;
+      assert(0);
+      break;
+    case OP_for_in_next:
+      // sf->cur_pc = pc;
+      // if (js_for_in_next(ctx, sp))
+      //     goto exception;
+      // sp += 2;
+      assert(0);
+      break;
+    case OP_for_of_start:
+      // sf->cur_pc = pc;
+      // if (js_for_of_start(ctx, sp, FALSE))
+      //     goto exception;
+      // sp += 1;
+      // *sp++ = JS_NewCatchOffset(ctx, 0);
+      assert(0);
+      break;
+    case OP_for_of_next: {
+    //   int offset = -3 - pc[0];
+      pc += 1;
+      assert(0);
+      // sf->cur_pc = pc;
+      // if (js_for_of_next(ctx, sp, offset))
+      //     goto exception;
+      // sp += 2;
+    } break;
+    case OP_for_await_of_next:
+      // sf->cur_pc = pc;
+      // if (js_for_await_of_next(ctx, sp))
+      //     goto exception;
+      // sp++;
+      assert(0);
+      break;
+    case OP_for_await_of_start:
+      // sf->cur_pc = pc;
+      // if (js_for_of_start(ctx, sp, TRUE))
+      //     goto exception;
+      // sp += 1;
+      // *sp++ = JS_NewCatchOffset(ctx, 0);
+      assert(0);
+      break;
+    case OP_iterator_get_value_done:
+      // sf->cur_pc = pc;
+      // if (js_iterator_get_value_done(ctx, sp))
+      //     goto exception;
+      // sp += 1;
+      assert(0);
+      break;
+    case OP_iterator_check_object:
+      // if (unlikely(!JS_IsObject(sp[-1]))) {
+      //     JS_ThrowTypeError(ctx, "iterator must return an object");
+      //     goto exception;
+      // }
+      assert(0);
+      break;
+
+    case OP_iterator_close:
+      /* iter_obj next catch_offset -> */
+      assert(0);
+      break;
+    case OP_nip_catch:
+      assert(0);
+      break;
+
+    case OP_iterator_next:
+      assert(0);
+      break;
+
+    case OP_iterator_call:
+      /* stack: iter_obj next catch_offset val */
+      pc++;
+      assert(0);
+      break;
+
+    case OP_lnot:
+      COMMENT("lnot");
+      if (!go.lnot) go.lnot = masm_new_label(as, "lnot_thunk");
+      masm_call(as, go.lnot);
+      break;
+
+    case OP_get_field:
+      COMMENT("get_field");
+      imm32 = get_u32(pc);
+      pc += 4;
+      INLINE_COMMENT(JS_AtomGetStr(ctx, buf, sizeof(buf), imm32));
+      masm_push_c_arg_imm64(as, 3, imm32);
+    emit_get_field:
+      if (!go.get_field) go.get_field = masm_new_label(as, "get_field_thunk");
+      masm_call(as, go.get_field);
+      break;
+
+    case OP_get_field2:
+      COMMENT("get_field2");
+      imm32 = get_u32(pc);
+      pc += 4;
+      INLINE_COMMENT(JS_AtomGetStr(ctx, buf, sizeof(buf), imm32));
+      masm_push_c_arg_imm64(as, 3, imm32);
+      if (!go.get_field2) go.get_field2 = masm_new_label(as, "get_field2_thunk");
+      masm_call(as, go.get_field2);
+      break;
+
+#if SHORT_OPCODES
+    case OP_get_length:
+      COMMENT("get_length");
+      masm_push_c_arg_imm64(as, 3, JS_ATOM_length);
+      goto emit_get_field;
+#endif
+
+    case OP_put_field: {
+      COMMENT("put_field");
+      imm32 = get_u32(pc);
+      pc += 4;
+      if (!go.put_field) go.put_field = masm_new_label(as, "put_field_thunk");
+      INLINE_COMMENT(JS_AtomGetStr(ctx, buf, sizeof(buf), imm32));
+      masm_mov_reg_imm32(as, kArg3Reg, imm32);
+      masm_call(as, go.put_field);
+    } break;
+
+    case OP_private_symbol: {
+    //   JSAtom atom;
+    //   JSValue val;
+
+    //   atom = get_u32(pc);
+      pc += 4;
+      assert(0);
+      // val = JS_NewSymbolFromAtom(ctx, atom, JS_ATOM_TYPE_PRIVATE);
+      // if (JS_IsException(val))
+      //     goto exception;
+      // *sp++ = val;
+    } break;
+
+    case OP_get_private_field: {
+      // JSValue val;
+
+      // val = JS_GetPrivateField(ctx, sp[-2], sp[-1]);
+      // JS_FreeValue(ctx, sp[-1]);
+      // JS_FreeValue(ctx, sp[-2]);
+      // sp[-2] = val;
+      // sp--;
+      // if (unlikely(JS_IsException(val)))
+      //     goto exception;
+      assert(0);
+    } break;
+
+    case OP_put_private_field: {
+      // int ret;
+      // ret = JS_SetPrivateField(ctx, sp[-3], sp[-1], sp[-2]);
+      // JS_FreeValue(ctx, sp[-3]);
+      // JS_FreeValue(ctx, sp[-1]);
+      // sp -= 3;
+      // if (unlikely(ret < 0))
+      //     goto exception;
+      assert(0);
+    } break;
+
+    case OP_define_private_field: {
+      // int ret;
+      // ret = JS_DefinePrivateField(ctx, sp[-3], sp[-2], sp[-1]);
+      // JS_FreeValue(ctx, sp[-2]);
+      // sp -= 2;
+      // if (unlikely(ret < 0))
+      //     goto exception;
+      assert(0);
+    } break;
+
+    case OP_define_field: {
+    //   int ret;
+    //   JSAtom atom;
+    //   atom = get_u32(pc);
+      pc += 4;
+      assert(0);
+
+      // ret = JS_DefinePropertyValue(ctx, sp[-2], atom, sp[-1],
+      //                              JS_PROP_C_W_E | JS_PROP_THROW);
+      // sp--;
+      // if (unlikely(ret < 0))
+      //     goto exception;
+    } break;
+
+    case OP_set_name: {
+    //   int ret;
+    //   JSAtom atom;
+    //   atom = get_u32(pc);
+      pc += 4;
+      assert(0);
+
+      // ret = JS_DefineObjectName(ctx, sp[-1], atom, JS_PROP_CONFIGURABLE);
+      // if (unlikely(ret < 0))
+      //     goto exception;
+    } break;
+    case OP_set_name_computed:
+      assert(0);
+      break;
+    case OP_set_proto:
+      assert(0);
+      break;
+    case OP_set_home_object:
+      // js_method_set_home_object(ctx, sp[-1], sp[-2]);
+      assert(0);
+      break;
+    case OP_define_method:
+    case OP_define_method_computed: {
+    //   JSValue getter, setter, value;
+    //   JSValueConst obj;
+    //   JSAtom atom;
+      BOOL is_computed;
+#define OP_DEFINE_METHOD_METHOD 0
+#define OP_DEFINE_METHOD_GETTER 1
+#define OP_DEFINE_METHOD_SETTER 2
+#define OP_DEFINE_METHOD_ENUMERABLE 4
+
+      is_computed = (opcode == OP_define_method_computed);
+      if (is_computed) {
+        // atom = JS_ValueToAtom(ctx, sp[-2]);
+        // if (unlikely(atom == JS_ATOM_NULL))
+        //     goto exception;
+        opcode += OP_define_method - OP_define_method_computed;
+      } else {
+        // atom = get_u32(pc);
+        pc += 4;
+      }
+      pc++;
+      assert(0);
+    } break;
+
+    case OP_define_class:
+    case OP_define_class_computed: {
+    //   int class_flags;
+    //   JSAtom atom;
+
+    //   atom = get_u32(pc);
+    //   class_flags = pc[4];
+      pc += 5;
+      assert(0);
+      // if (js_op_define_class(ctx, sp, atom, class_flags,
+      //                        var_refs, sf,
+      //                        (opcode == OP_define_class_computed)) < 0)
+      //     goto exception;
+    } break;
+
+    case OP_get_array_el:
+      assert(0);
+      break;
+
+    case OP_get_array_el2:
+      assert(0);
+      break;
+
+    case OP_get_array_el3:
+      assert(0);
+      break;
+
+    case OP_get_ref_value:
+      assert(0);
+      break;
+
+    case OP_get_super_value:
+      assert(0);
+      break;
+
+    case OP_put_array_el:
+      assert(0);
+      break;
+
+    case OP_put_ref_value:
+      assert(0);
+      break;
+
+    case OP_put_super_value:
+      assert(0);
+      break;
+
+    case OP_define_array_el: {
+      // int ret;
+      // ret = JS_DefinePropertyValueValue(ctx, sp[-3], JS_DupValue(ctx,
+      // sp[-2]), sp[-1],
+      //                                   JS_PROP_C_W_E | JS_PROP_THROW);
+      // sp -= 1;
+      // if (unlikely(ret < 0))
+      //     goto exception;
+      assert(0);
+    } break;
+
+    case OP_append: /* array pos enumobj -- array pos */
+    {
+      // sf->cur_pc = pc;
+      // if (js_append_enumerate(ctx, sp))
+      //     goto exception;
+      // JS_FreeValue(ctx, *--sp);
+      assert(0);
+    } break;
+
+    case OP_copy_data_properties: /* target source excludeList */
+    {
+      /* stack offsets (-1 based:
+         2 bits for target,
+         3 bits for source,
+         2 bits for exclusionList */
+
+      imm32 = *pc++;
+      assert(0);
+      // sf->cur_pc = pc;
+      // if (JS_CopyDataProperties(ctx, sp[-1 - (mask & 3)],
+      //                           sp[-1 - ((mask >> 2) & 7)],
+      //                           sp[-1 - ((mask >> 5) & 7)], 0))
+      //     goto exception;
+    } break;
+
+    case OP_add:
+      COMMENT("add");
+      if (!go.add) go.add = masm_new_label(as, "add_thunk");
+      masm_call(as, go.add);
+      break;
+    case OP_add_loc:
+      imm32 = *pc;
+      pc += 1;
+      COMMENT("add_loc %d", imm32);
+      if (!go.add_loc) go.add_loc = masm_new_label(as, "add_loc_thunk");
+      masm_add_reg_imm32(as, kArg3Reg, kVarBufReg, imm32 * 8);
+      masm_call(as, go.add_loc);
+      break;
+    case OP_sub:
+      COMMENT("sub");
+      if (!go.sub) go.sub = masm_new_label(as, "sub_thunk");
+      masm_call(as, go.sub);
+      break;
+    case OP_mul:
+      COMMENT("mul");
+      if (!go.mul) go.mul = masm_new_label(as, "mul_thunk");
+      masm_call(as, go.mul);
+      break;
+    case OP_div:
+      COMMENT("div");
+      if (!go.div) go.div = masm_new_label(as, "div_thunk");
+      masm_call(as, go.div);
+      break;
+    case OP_mod:
+      COMMENT("mod");
+      if (!go.mod) go.mod = masm_new_label(as, "mod_thunk");
+      masm_call(as, go.mod);
+      break;
+    case OP_pow:
+      COMMENT("pow");
+      if (!go.pow) go.pow = masm_new_label(as, "pow_thunk");
+      masm_call(as, go.pow);
+      break;
+    case OP_plus:
+      COMMENT("plus");
+      if (!go.plus) go.plus = masm_new_label(as, "plus_thunk");
+      masm_call(as, go.plus);
+      break;
+    case OP_neg:
+      COMMENT("neg");
+      if (!go.neg) go.neg = masm_new_label(as, "neg_thunk");
+      masm_call(as, go.neg);
+      break;
+    case OP_inc:
+      COMMENT("inc");
+      if (!go.inc) go.inc = masm_new_label(as, "inc_thunk");
+      masm_call(as, go.inc);
+      break;
+    case OP_dec:
+      COMMENT("dec");
+      if (!go.dec) go.dec = masm_new_label(as, "dec_thunk");
+      masm_call(as, go.dec);
+      break;
+    case OP_post_inc:
+      COMMENT("post_inc");
+      if (!go.post_inc) go.post_inc = masm_new_label(as, "post_inc_thunk");
+      masm_call(as, go.post_inc);
+      break;
+    case OP_post_dec:
+      COMMENT("post_dec");
+      if (!go.post_dec) go.post_dec = masm_new_label(as, "post_dec_thunk");
+      masm_call(as, go.post_dec);
+      break;
+    case OP_inc_loc: {
+    //   JSValue op1;
+    //   int val;
+    //   int idx;
+    //   idx = *pc;
+      pc += 1;
+      assert(0);
+    } break;
+    case OP_dec_loc: {
+    //   JSValue op1;
+    //   int val;
+    //   int idx;
+    //   idx = *pc;
+      pc += 1;
+      assert(0);
+    } break;
+    case OP_not:
+      COMMENT("not");
+      if (!go.not) go.not = masm_new_label(as, "not_thunk");
+      masm_call(as, go.not);
+      break;
+
+    case OP_shl:
+      COMMENT("shl");
+      if (!go.shl) go.shl = masm_new_label(as, "shl_thunk");
+      masm_call(as, go.shl);
+      break;
+    case OP_shr:
+      COMMENT("shr");
+      if (!go.shr) go.shr = masm_new_label(as, "shr_thunk");
+      masm_call(as, go.shr);
+      break;
+    case OP_sar:
+      COMMENT("sar");
+      if (!go.sar) go.sar = masm_new_label(as, "sar_thunk");
+      masm_call(as, go.sar);
+      break;
+    case OP_and:
+      COMMENT("and");
+      if (!go.and) go.and = masm_new_label(as, "and_thunk");
+      masm_call(as, go.and);
+      break;
+    case OP_or:
+      COMMENT("or");
+      if (!go.or) go.or = masm_new_label(as, "or_thunk");
+      masm_call(as, go.or);
+      break;
+    case OP_xor:
+      COMMENT("xor");
+      if (!go.xor) go.xor = masm_new_label(as, "xor_thunk");
+      masm_call(as, go.xor);
+      break;
+    
+    case OP_lt:
+      COMMENT("lt");
+      if (is_if_xxx(*pc)) {
+emit_goto_if:;
+        COMMENT("& if_xx");
+        if (!go.goto_if[opcode - OP_lt]) go.goto_if[opcode - OP_lt] = masm_new_label(as, NULL);
+        masm_call(as, go.goto_if[opcode - OP_lt]);
+        BOOL if_false = FALSE;
+#if SHORT_OPCODES
+        if (*pc == OP_if_false8) {
+            imm32 = (pc + 1 - b->byte_code_buf) + (int8_t)pc[1];
+            pc += 2;
+            if_false = TRUE;
+        } else if (*pc == OP_if_true8) {
+            imm32 = (pc + 1 - b->byte_code_buf) + (int8_t)pc[1];
+            pc += 2;
+        } else
+#endif
+        if (*pc == OP_if_false) {
+            imm32 = (pc + 1 - b->byte_code_buf) + (int32_t)get_u32(pc + 1);
+            pc += 5;
+            if_false = TRUE;
+        } else if (*pc == OP_if_true) {
+            imm32 = (pc + 1 - b->byte_code_buf) + (int8_t)pc[1];
+            pc += 2;
+        }
+        if (if_false) {
+            masm_cbz32(as, kRetReg, labels[imm32]);
+        } else {
+            masm_cbnz32(as, kRetReg, labels[imm32]);
+        }
+        break;
+      }
+      if (!go.lt[0]) go.lt[0] = masm_new_label(as, "lt_thunk");
+      masm_call(as, go.lt[0]);
+      break;
+    case OP_lte:
+      COMMENT("lte");
+      if (is_if_xxx(*pc)) goto emit_goto_if;
+      if (!go.lt[1]) go.lt[1] = masm_new_label(as, "lte_thunk");
+      masm_call(as, go.lt[1]);
+      break;
+    case OP_gt:
+      COMMENT("gt");
+      if (is_if_xxx(*pc)) goto emit_goto_if;
+      if (!go.lt[2]) go.lt[2] = masm_new_label(as, "gt_thunk");
+      masm_call(as, go.lt[2]);
+      break;
+    case OP_gte:
+      COMMENT("gte");
+      if (is_if_xxx(*pc)) goto emit_goto_if;
+      if (!go.lt[3]) go.lt[3] = masm_new_label(as, "gte_thunk");
+      masm_call(as, go.lt[3]);
+      break;
+    case OP_eq:
+      COMMENT("eq");
+      if (is_if_xxx(*pc)) goto emit_goto_if;
+      if (!go.eq) go.eq = masm_new_label(as, "eq_thunk");
+      masm_call(as, go.eq);
+      break;
+    case OP_neq:
+      COMMENT("neq");
+      if (is_if_xxx(*pc)) goto emit_goto_if;
+      if (!go.neq) go.neq = masm_new_label(as, "neq_thunk");
+      masm_call(as, go.neq);
+      break;
+    case OP_strict_eq:
+      COMMENT("strict_eq");
+      if (is_if_xxx(*pc)) goto emit_goto_if;
+      if (!go.strict_eq) go.strict_eq = masm_new_label(as, "strict_eq_thunk");
+      masm_call(as, go.strict_eq);
+      break;
+    case OP_strict_neq:
+      COMMENT("strict_neq");
+      if (is_if_xxx(*pc)) goto emit_goto_if;
+      if (!go.strict_neq) go.strict_neq = masm_new_label(as, "strict_neq_thunk");
+      masm_call(as, go.strict_neq);
+      break;
+
+    case OP_in:
+      // sf->cur_pc = pc;
+      // if (js_operator_in(ctx, sp))
+      //     goto exception;
+      // sp--;
+      assert(0);
+      break;
+    case OP_private_in:
+      // sf->cur_pc = pc;
+      // if (js_operator_private_in(ctx, sp))
+      //     goto exception;
+      // sp--;
+      assert(0);
+      break;
+    case OP_instanceof:
+      // sf->cur_pc = pc;
+      // if (js_operator_instanceof(ctx, sp))
+      //     goto exception;
+      // sp--;
+      assert(0);
+      break;
+    case OP_typeof: {
+      // JSValue op1;
+      // JSAtom atom;
+
+      // op1 = sp[-1];
+      // atom = js_operator_typeof(ctx, op1);
+      // JS_FreeValue(ctx, op1);
+      // sp[-1] = JS_AtomToString(ctx, atom);
+      assert(0);
+    } break;
+    case OP_delete:
+      // sf->cur_pc = pc;
+      // if (js_operator_delete(ctx, sp))
+      //     goto exception;
+      // sp--;
+      assert(0);
+      break;
+    case OP_delete_var: {
+    //   JSAtom atom;
+    //   int ret;
+
+    //   atom = get_u32(pc);
+      pc += 4;
+      assert(0);
+      // sf->cur_pc = pc;
+
+      // ret = JS_DeleteGlobalVar(ctx, atom);
+      // if (unlikely(ret < 0))
+      //     goto exception;
+      // *sp++ = JS_NewBool(ctx, ret);
+    } break;
+
+    case OP_to_object:
+      // if (JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_OBJECT) {
+      //     sf->cur_pc = pc;
+      //     ret_val = JS_ToObject(ctx, sp[-1]);
+      //     if (JS_IsException(ret_val))
+      //         goto exception;
+      //     JS_FreeValue(ctx, sp[-1]);
+      //     sp[-1] = ret_val;
+      // }
+      assert(0);
+      break;
+
+    case OP_to_propkey:
+      // switch (JS_VALUE_GET_TAG(sp[-1])) {
+      // case JS_TAG_INT:
+      // case JS_TAG_STRING:
+      // case JS_TAG_SYMBOL:
+      //     break;
+      // default:
+      //     sf->cur_pc = pc;
+      //     ret_val = JS_ToPropertyKey(ctx, sp[-1]);
+      //     if (JS_IsException(ret_val))
+      //         goto exception;
+      //     JS_FreeValue(ctx, sp[-1]);
+      //     sp[-1] = ret_val;
+      //     break;
+      // }
+      assert(0);
+      break;
+
+    case OP_with_get_var:
+    case OP_with_put_var:
+    case OP_with_delete_var:
+    case OP_with_make_ref:
+    case OP_with_get_ref: {
+    //   JSAtom atom;
+    //   int32_t diff;
+    //   JSValue obj, val;
+    //   int ret, is_with;
+    //   atom = get_u32(pc);
+    //   diff = get_u32(pc + 4);
+    //   is_with = pc[8];
+      pc += 9;
+      assert(0);
+    } break;
+
+    case OP_await:
+      // ret_val = JS_NewInt32(ctx, FUNC_RET_AWAIT);
+      // goto done_generator;
+      assert(0);
+      break;
+    case OP_yield:
+      // ret_val = JS_NewInt32(ctx, FUNC_RET_YIELD);
+      // goto done_generator;
+      assert(0);
+      break;
+    case OP_yield_star:
+    case OP_async_yield_star:
+      // ret_val = JS_NewInt32(ctx, FUNC_RET_YIELD_STAR);
+      // goto done_generator;
+      assert(0);
+      break;
+    case OP_return_async:
+      // ret_val = JS_UNDEFINED;
+      // goto done_generator;
+      assert(0);
+      break;
+    case OP_initial_yield:
+      // ret_val = JS_NewInt32(ctx, FUNC_RET_INITIAL_YIELD);
+      // goto done_generator;
+      assert(0);
+      break;
+
+    case OP_nop:
+      break;
+    case OP_is_undefined_or_null:
+      // if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNDEFINED ||
+      //     JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_NULL) {
+      //     goto set_true;
+      // } else {
+      //     goto free_and_set_false;
+      // }
+      assert(0);
+#if SHORT_OPCODES
+    case OP_is_undefined:
+      // if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNDEFINED) {
+      //     goto set_true;
+      // } else {
+      //     goto free_and_set_false;
+      // }
+      assert(0);
+    case OP_is_null:
+      // if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_NULL) {
+      //     goto set_true;
+      // } else {
+      //     goto free_and_set_false;
+      // }
+      /* XXX: could merge to a single opcode */
+      assert(0);
+    case OP_typeof_is_undefined:
+      /* different from OP_is_undefined because of isHTMLDDA */
+      // if (js_operator_typeof(ctx, sp[-1]) == JS_ATOM_undefined) {
+      //     goto free_and_set_true;
+      // } else {
+      //     goto free_and_set_false;
+      // }
+      assert(0);
+    case OP_typeof_is_function:
+      // if (js_operator_typeof(ctx, sp[-1]) == JS_ATOM_function) {
+      //     goto free_and_set_true;
+      // } else {
+      //     goto free_and_set_false;
+      // }
+    // free_and_set_true:;
+    // JS_FreeValue(ctx, sp[-1]);
+    assert(0);
+#endif
+    // set_true:;
+      // sp[-1] = JS_TRUE;
+    //   break;
+    // free_and_set_false:;
+      // JS_FreeValue(ctx, sp[-1]);
+      // sp[-1] = JS_FALSE;
+      break;
+    default:
+      fprintf(stderr, "invalid opcode: pc=%u opcode=0x%02x",
+              (int)(pc - b->byte_code_buf - 1), opcode);
+      masm_delete(as);
+      js_free(ctx, labels);
+      return;
+    }
+  }
+
+  if (go.fclosure) {
+    masm_bind(as, go.fclosure);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    masm_push_c_arg_reg(as, 2, kSfReg);
+    INLINE_COMMENT("fclosure_stub");
+    masm_call_stub(as, fclosure_stub, 1);
+    INLINE_COMMENT("*sp++ = ret_val");
+    masm_push_reg(as, kRetReg);
+    masm_cmp_reg_imm64(as, kRetReg, JS_EXCEPTION);
+    masm_b_eq(as, go.done);
+    masm_ret(as);
+  }
+
+  if (go.get_field) {
+    masm_bind(as, go.get_field);
+    INLINE_COMMENT("keep = false");
+    masm_push_c_arg_imm64(as, 4, 0);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("get_field_stub");
+    masm_call_stub(as, get_field_stub, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+    masm_ret(as);
+  }
+  if (go.get_field2) {
+    masm_bind(as, go.get_field2);
+    INLINE_COMMENT("keep = true");
+    masm_push_c_arg_imm64(as, 4, 1);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("get_field_stub");
+    masm_call_stub(as, get_field_stub, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+    INLINE_COMMENT("sp++");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, 8);
+    masm_ret(as);
+  }
+
+  if (go.put_field) {
+    masm_bind(as, go.put_field);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("put_field_stub");
+    masm_call_stub(as, put_field_stub, 1);
+    INLINE_COMMENT("sp -= 2");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -16);
+    masm_cbnz(as, kRetReg, go.exception);
+    masm_ret(as);
+  }
+
+  if (go.put_var_ref) {
+    masm_bind(as, go.put_var_ref);
+    INLINE_COMMENT("pvalue");
+    masm_ldr2(as, kArg3Reg, kArg3Reg, kHeapReg);
+    INLINE_COMMENT("new_value = *--sp");
+    masm_pop_reg(as, kArg1Reg);
+    INLINE_COMMENT("old_value = *pvalue");
+    masm_ldr(as, kArg2Reg, kArg3Reg, 0); // free_value requires
+    INLINE_COMMENT("*pvalue = new_value");
+    masm_str(as, kArg1Reg, kArg3Reg, 0);
+    if (!go.free_value) go.free_value = masm_new_label(as, "free_value_thunk");
+    if (go.drop) masm_jmp(as, go.free_value);
+  }
+  if (go.drop) {
+    masm_bind(as, go.drop);
+    INLINE_COMMENT("old_value = *--sp");
+    masm_pop_reg(as, kArg2Reg);
+  }
+  if (go.drop || go.free_value) {
+    if (go.free_value) masm_bind(as, go.free_value);
+    masm_label_t skip = masm_new_label(as, NULL);
+    masm_lsr(as, kArg1Reg, kArg2Reg, 32);
+    INLINE_COMMENT("JS_TAG_FIRST");
+    masm_cmp_reg_imm32(as, kArg1Reg, JS_TAG_FIRST);
+    masm_b_lo(as, skip);
+    masm_dec32_rtmem(as, kArg2Reg, skip);
+    masm_push_c_arg_reg(as, 1, kHeapReg);
+    INLINE_COMMENT("__JS_FreeValueRT");
+    masm_call_stub(as, __JS_FreeValueRT, 1);
+    masm_bind(as, skip);
+    masm_ret(as);
+  }
+
+  if (go.get_var) {
+    masm_bind(as, go.get_var);
+    masm_push_c_arg_reg(as, 4, kSfReg);
+    masm_push_c_arg_reg(as, 3, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    masm_call_stub(as, get_var_stub, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+    INLINE_COMMENT("sp++");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, 8);
+    masm_ret(as);
+  }
+  if (go.put_var) {
+    masm_bind(as, go.put_var);
+    masm_push_c_arg_reg(as, 4, kSfReg);
+    masm_push_c_arg_reg(as, 3, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    masm_call_stub(as, put_var_stub, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+
+  if (go.post_inc) {
+    masm_label_t post_inc_slow = masm_new_label(as, NULL);
+    masm_label_t skip = masm_new_label(as, NULL);
+    masm_bind(as, go.post_inc);
+    INLINE_COMMENT("v = sp[-1]");
+    masm_ldr(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_mov_reg_imm32(as, kArg3Reg, 0xffffffff);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_hi(as, post_inc_slow);
+    masm_cmp_reg_imm32(as, kArg1Reg, INT32_MAX);
+    masm_b_eq(as, post_inc_slow);
+    INLINE_COMMENT("r = v + 1");
+    masm_add_reg_imm32(as, kArg1Reg, kArg1Reg, 1);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_hi(as, post_inc_slow);
+    INLINE_COMMENT("sp[0] = JS_NewInt32(ctx, r)");
+    masm_str(as, kArg1Reg, kStkReg, 0);
+    masm_jmp(as, skip);
+
+    masm_bind(as, post_inc_slow);
+    INLINE_COMMENT("OP_post_inc");
+    masm_push_c_arg_imm64(as, 3, OP_post_inc);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("js_post_inc_slow");
+    masm_call_stub(as, js_post_inc_slow, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+
+    masm_bind(as, skip);
+    INLINE_COMMENT("sp++");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, 8);
+    masm_ret(as);
+  }
+
+  if (go.post_dec) {
+    masm_label_t post_dec_slow = masm_new_label(as, NULL);
+    masm_label_t skip = masm_new_label(as, NULL);
+    masm_bind(as, go.post_dec);
+    INLINE_COMMENT("v = sp[-1]");
+    masm_ldr(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_mov_reg_imm32(as, kArg3Reg, 0xffffffff);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_hi(as, post_dec_slow);
+    masm_cmp_reg_imm32(as, kArg1Reg, INT32_MIN);
+    masm_b_eq(as, post_dec_slow);
+    INLINE_COMMENT("r = v - 1");
+    masm_add_reg_imm32(as, kArg1Reg, kArg1Reg, 1);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_hi(as, post_dec_slow);
+    INLINE_COMMENT("sp[0] = JS_NewInt32(ctx, r)");
+    masm_zero_reg_hi32(as, kArg1Reg);
+    masm_str(as, kArg1Reg, kStkReg, 0);
+    masm_jmp(as, skip);
+
+    masm_bind(as, post_dec_slow);
+    INLINE_COMMENT("OP_post_dec");
+    masm_push_c_arg_imm64(as, 3, OP_post_dec);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("js_post_inc_slow");
+    masm_call_stub(as, js_post_inc_slow, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+
+    masm_bind(as, skip);
+    INLINE_COMMENT("sp++");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, 8);
+    masm_ret(as);
+  }
+
+  masm_label_t new_float64 = 0;
+  masm_label_t new2_float64 = 0;
+  masm_label_t binary_arith_slow = 0;
+
+  if (go.sub_const) {
+    masm_label_t sub_slow = masm_new_label(as, NULL);
+    new_float64 = masm_new_label(as, "new_float64_thunk");
+    masm_bind(as, go.sub_const);
+    masm_ldr(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_mov_reg_imm32(as, kArg3Reg, 0xffffffff);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_hi(as, sub_slow);
+    INLINE_COMMENT("r = sp[-1] - imm");
+    masm_sub_reg(as, kArg1Reg, kArg1Reg, kArg2Reg);
+    masm_sxtw(as, kArg4Reg, kArg1Reg);
+    masm_cmp_reg(as, kArg1Reg, kArg4Reg);
+    masm_b_ne(as, new_float64);
+    INLINE_COMMENT("sp[-1] = JS_NewInt32(ctx, r)");
+    masm_zero_reg_hi32(as, kArg1Reg);
+    masm_str(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_ret(as);
+
+    masm_bind(as, sub_slow);
+    INLINE_COMMENT("op2");
+    masm_push_reg(as, kArg2Reg);
+    masm_push_c_arg_imm64(as, 3, OP_sub);
+    if (!binary_arith_slow) binary_arith_slow = masm_new_label(as, "binary_arith_slow_thunk");
+    masm_jmp(as, binary_arith_slow);
+  }
+  if (go.sub) {
+    masm_label_t sub_slow = masm_new_label(as, NULL);
+    new2_float64 = masm_new_label(as, "new_float64_thunk2");
+    masm_bind(as, go.sub);
+    masm_ldp(as, kArg1Reg, kArg2Reg, kStkReg, -2 * 8);
+    masm_mov_reg_imm32(as, kArg3Reg, 0xffffffff);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_hi(as, sub_slow);
+    masm_cmp_reg(as, kArg2Reg, kArg3Reg);
+    masm_b_hi(as, sub_slow);
+    INLINE_COMMENT("r = sp[-2] - sp[-1]");
+    masm_sub_reg(as, kArg1Reg, kArg1Reg, kArg2Reg);
+    masm_sxtw(as, kArg4Reg, kArg1Reg);
+    masm_cmp_reg(as, kArg1Reg, kArg4Reg);
+    masm_b_ne(as, new2_float64);
+    INLINE_COMMENT("sp[-2] = JS_NewInt32(ctx, r)");
+    masm_zero_reg_hi32(as, kArg1Reg);
+    masm_str(as, kArg1Reg, kStkReg, -2 * 8);
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+
+    masm_bind(as, sub_slow);
+    masm_push_c_arg_imm64(as, 3, OP_sub);
+    if (!binary_arith_slow) binary_arith_slow = masm_new_label(as, "binary_arith_slow_thunk");
+    masm_jmp(as, binary_arith_slow);
+  }
+  
+  if (go.add_const) {
+    masm_label_t add_slow = masm_new_label(as, NULL);
+    new_float64 = masm_new_label(as, "new_float64_thunk");
+    masm_bind(as, go.add_const);
+    masm_ldr(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_mov_reg_imm32(as, kArg3Reg, 0xffffffff);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_hi(as, add_slow);
+    INLINE_COMMENT("r = sp[-1] + imm");
+    masm_add_reg(as, kArg1Reg, kArg1Reg, kArg2Reg);
+    masm_sxtw(as, kArg4Reg, kArg1Reg);
+    masm_cmp_reg(as, kArg1Reg, kArg4Reg);
+    masm_b_ne(as, new_float64);
+    INLINE_COMMENT("sp[-1] = JS_NewInt32(ctx, r)");
+    masm_zero_reg_hi32(as, kArg1Reg);
+    masm_str(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_ret(as);
+
+    masm_bind(as, add_slow);
+    INLINE_COMMENT("op2");
+    masm_push_reg(as, kArg2Reg);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("js_add_slow");
+    masm_call_stub(as, js_add_slow, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+  if (go.add) {
+    masm_label_t add_slow = masm_new_label(as, NULL);
+    masm_label_t skip = masm_new_label(as, NULL);
+    new2_float64 = masm_new_label(as, "new_float64_thunk2");
+    masm_bind(as, go.add);
+    masm_ldp(as, kArg1Reg, kArg2Reg, kStkReg, -2 * 8);
+    masm_mov_reg_imm32(as, kArg3Reg, 0xffffffff);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_hi(as, add_slow);
+    masm_cmp_reg(as, kArg2Reg, kArg3Reg);
+    masm_b_hi(as, add_slow);
+    INLINE_COMMENT("r = sp[-2] + sp[-1]");
+    masm_add_reg(as, kArg1Reg, kArg1Reg, kArg2Reg);
+    masm_sxtw(as, kArg4Reg, kArg1Reg);
+    masm_cmp_reg(as, kArg1Reg, kArg4Reg);
+    masm_b_ne(as, new2_float64);
+    INLINE_COMMENT("sp[-2] = JS_NewInt32(ctx, r)");
+    masm_zero_reg_hi32(as, kArg1Reg);
+    masm_str(as, kArg1Reg, kStkReg, -2 * 8);
+    masm_jmp(as, skip);
+
+    masm_bind(as, add_slow);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("js_add_slow");
+    masm_call_stub(as, js_add_slow, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+
+    masm_bind(as, skip);
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+
+  if (go.add_loc) {
+    masm_label_t add_loc_slow = masm_new_label(as, NULL);
+    masm_label_t skip = masm_new_label(as, NULL);
+    masm_bind(as, go.add_loc);
+    masm_ldr(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_ldr(as, kArg2Reg, kArg3Reg, 0);
+    masm_mov_reg_imm32(as, kArg4Reg, 0xffffffff);
+    masm_cmp_reg(as, kArg1Reg, kArg4Reg);
+    masm_b_hi(as, add_loc_slow);
+    masm_cmp_reg(as, kArg2Reg, kArg4Reg);
+    masm_b_hi(as, add_loc_slow);
+    INLINE_COMMENT("r = sp[-1] + var_buf[idx]");
+    masm_add_reg(as, kArg1Reg, kArg1Reg, kArg2Reg);
+    masm_sxtw(as, kArg4Reg, kArg1Reg);
+    masm_cmp_reg(as, kArg1Reg, kArg4Reg);
+    masm_b_ne(as, add_loc_slow);
+    INLINE_COMMENT("var_buf[idx] = JS_NewInt32(ctx, r)");
+    masm_zero_reg_hi32(as, kArg1Reg);
+    masm_str(as, kArg1Reg, kArg3Reg, 0);
+    masm_jmp(as, skip);
+
+    masm_bind(as, add_loc_slow); // TODO: dup two operands
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("add_loc_stub");
+    masm_call_stub(as, add_loc_stub, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+
+    masm_bind(as, skip);
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+
+  if (go.mul_const) {
+    masm_label_t new_int32 = masm_new_label(as, NULL);
+    masm_label_t mul_slow = masm_new_label(as, NULL);
+    new_float64 = masm_new_label(as, "new_float64_thunk");
+    masm_bind(as, go.mul_const);
+    masm_ldr(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_mov_reg_imm32(as, kArg3Reg, 0xffffffff);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_hi(as, mul_slow);
+    INLINE_COMMENT("r = sp[-2] * imm");
+    masm_mov_reg(as, kArg4Reg, kArg1Reg);
+    masm_mul_reg32(as, kArg1Reg, kArg1Reg, kArg2Reg);
+    masm_sxtw(as, kArg3Reg, kArg1Reg);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_ne(as, new_float64);
+    masm_cmp_reg_imm64(as, kArg1Reg, 0);
+    masm_b_ne(as, new_int32);
+    masm_orr_reg(as, kArg4Reg, kArg2Reg);
+    masm_cmp_reg_imm32(as, kArg4Reg, 0);
+    masm_b_ge(as, new_int32);
+    masm_mov_reg_imm64(as, kArg1Reg, __JS_NewFloat64(ctx, -0.0));
+    masm_str(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_ret(as);
+
+    masm_bind(as, new_int32);
+    INLINE_COMMENT("sp[-2] = JS_NewInt32(ctx, r)");
+    masm_zero_reg_hi32(as, kArg1Reg);
+    masm_str(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_ret(as);
+
+    masm_bind(as, mul_slow);
+    INLINE_COMMENT("op2");
+    masm_push_reg(as, kArg2Reg);
+    INLINE_COMMENT("OP_mul");
+    masm_push_c_arg_imm64(as, 3, OP_mul);
+    if (!binary_arith_slow) binary_arith_slow = masm_new_label(as, "binary_arith_slow_thunk");
+    masm_jmp(as, binary_arith_slow);
+  }
+
+  if (go.mul) {
+    masm_label_t new_int32 = masm_new_label(as, NULL);
+    masm_label_t mul_slow = masm_new_label(as, NULL);
+    masm_label_t skip = masm_new_label(as, NULL);
+    new2_float64 = masm_new_label(as, "new_float64_thunk2");
+    masm_bind(as, go.mul);
+    masm_ldp(as, kArg1Reg, kArg2Reg, kStkReg, -2 * 8);
+    masm_mov_reg_imm32(as, kArg3Reg, 0xffffffff);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_hi(as, mul_slow);
+    masm_cmp_reg(as, kArg2Reg, kArg3Reg);
+    masm_b_hi(as, mul_slow);
+    INLINE_COMMENT("r = sp[-2] * sp[-1]");
+    masm_mov_reg(as, kArg4Reg, kArg1Reg);
+    masm_mul_reg32(as, kArg1Reg, kArg1Reg, kArg2Reg);
+    masm_sxtw(as, kArg3Reg, kArg1Reg);
+    masm_cmp_reg(as, kArg1Reg, kArg3Reg);
+    masm_b_ne(as, new2_float64);
+    masm_cmp_reg_imm64(as, kArg1Reg, 0);
+    masm_b_ne(as, new_int32);
+    masm_orr_reg(as, kArg4Reg, kArg2Reg);
+    masm_cmp_reg_imm32(as, kArg4Reg, 0);
+    masm_b_ge(as, new_int32);
+    masm_mov_reg_imm64(as, kArg1Reg, __JS_NewFloat64(ctx, -0.0));
+    masm_str(as, kArg1Reg, kStkReg, -2 * 8);
+    masm_jmp(as, skip);
+
+    masm_bind(as, new_int32);
+    INLINE_COMMENT("sp[-2] = JS_NewInt32(ctx, r)");
+    masm_zero_reg_hi32(as, kArg1Reg);
+    masm_str(as, kArg1Reg, kStkReg, -2 * 8);
+
+    masm_bind(as, skip);
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+
+    masm_bind(as, mul_slow);
+    INLINE_COMMENT("OP_mul");
+    masm_push_c_arg_imm64(as, 3, OP_mul);
+    if (!binary_arith_slow) binary_arith_slow = masm_new_label(as, "binary_arith_slow_thunk");
+    masm_jmp(as, binary_arith_slow);
+  }
+
+  if (new_float64) {
+    masm_bind(as, new_float64);
+    masm_toNewFloat64(as, kArg1Reg);
+    INLINE_COMMENT("sp[-1] = __JS_NewFloat64(ctx, r)");
+    masm_str(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_ret(as);
+  }
+  if (new2_float64) {
+    masm_bind(as, new2_float64);
+    masm_toNewFloat64(as, kArg1Reg);
+    INLINE_COMMENT("sp[-2] = __JS_NewFloat64(ctx, r)");
+    masm_str(as, kArg1Reg, kStkReg, -2 * 8);
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+
+  if (go.lnot) {
+    masm_bind(as, go.lnot);
+    masm_jmp(as, go.lnot);
+  }
+  if (go.not) {
+    masm_bind(as, go.not);
+    masm_jmp(as, go.not);
+  }
+  if (go.mod) {
+    masm_bind(as, go.mod);
+    INLINE_COMMENT("OP_mod");
+    masm_push_c_arg_imm64(as, 3, OP_mod);
+    if (!binary_arith_slow) binary_arith_slow = masm_new_label(as, "binary_arith_slow_thunk");
+    masm_jmp(as, binary_arith_slow);
+  }
+  if (go.pow) {
+    masm_bind(as, go.pow);
+    INLINE_COMMENT("OP_pow");
+    masm_push_c_arg_imm64(as, 3, OP_pow);
+    if (!binary_arith_slow) binary_arith_slow = masm_new_label(as, "binary_arith_slow_thunk");
+    masm_jmp(as, binary_arith_slow);
+  }
+  if (go.div) {
+    masm_bind(as, go.div);
+    INLINE_COMMENT("OP_div");
+    masm_push_c_arg_imm64(as, 3, OP_div);
+    if (!binary_arith_slow) binary_arith_slow = masm_new_label(as, "binary_arith_slow_thunk");
+  }
+  if (binary_arith_slow) {
+    masm_bind(as, binary_arith_slow);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("js_binary_arith_slow");
+    masm_call_stub(as, js_binary_arith_slow, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+
+  if (go.plus) {
+    masm_label_t null_bool = masm_new_label(as, NULL);
+    masm_label_t skip = masm_new_label(as, NULL);
+    masm_bind(as, go.plus);
+    masm_ldr(as, kArg1Reg, kStkReg, -1 * 8);
+    masm_lsr(as, kArg2Reg, kArg1Reg, 32);
+    masm_cmp_reg_imm32(as, kArg2Reg, 0);
+    masm_b_eq(as, skip);
+    masm_cmp_reg_imm32(as, kArg2Reg, JS_TAG_NULL);
+    masm_b_ls(as, null_bool);
+    masm_add_reg_imm32(as, kArg2Reg, kArg2Reg, -JS_TAG_FIRST);
+
+    masm_bind(as, null_bool);
+    INLINE_COMMENT("sp[-1] = JS_NewInt32(ctx, JS_VALUE_GET_INT(op))");
+    masm_zero_reg_hi32(as, kArg1Reg);
+    masm_str(as, kArg1Reg, kStkReg, -2 * 8);
+
+    masm_bind(as, skip);
+    masm_ret(as);
+  }
+  if (go.neg) {
+    masm_bind(as, go.neg);
+    masm_jmp(as, go.neg);
+  }
+  if (go.inc) {
+    masm_bind(as, go.inc);
+    masm_jmp(as, go.inc);
+  }
+  if (go.dec) {
+    masm_bind(as, go.dec);
+    masm_jmp(as, go.dec);
+  }
+  if (go.shl) {
+    masm_bind(as, go.shl);
+    masm_jmp(as, go.shl);
+  }
+  if (go.shr) {
+    masm_bind(as, go.shr);
+    masm_jmp(as, go.shr);
+  }
+  if (go.sar) {
+    masm_bind(as, go.sar);
+    masm_jmp(as, go.sar);
+  }
+  if (go.and) {
+    masm_bind(as, go.and);
+    masm_jmp(as, go.and);
+  }
+  if (go.or) {
+    masm_bind(as, go.or);
+    masm_jmp(as, go.or);
+  }
+  if (go.xor) {
+    masm_bind(as, go.xor);
+    masm_jmp(as, go.xor);
+  }
+
+  // push imm & cmp & if_true/false
+  for (int opcode = OP_eq; opcode <= OP_strict_neq; opcode++)
+  if (go.eq_const[opcode - OP_eq]) {
+    masm_label_t slow = masm_new_label(as, NULL);
+    masm_bind(as, go.eq_const[opcode - OP_eq]);
+    INLINE_COMMENT("v = *--sp");
+    masm_pop_reg(as, kArg1Reg);
+    masm_cmp_reg_imm64(as, kArg1Reg, 0xffffffff);
+    masm_b_hi(as, slow);
+
+    INLINE_COMMENT("v vs imm");
+    masm_cmp_reg32(as, kArg1Reg, kArg2Reg);
+    masm_ret(as);
+
+    masm_bind(as, slow);
+    INLINE_COMMENT("op1");
+    masm_push_reg(as, kArg1Reg);
+    INLINE_COMMENT("op2");
+    masm_push_reg(as, kArg2Reg);
+    INLINE_COMMENT("is_neg");
+    masm_push_c_arg_imm64(as, 3, opcode == OP_neq || opcode == OP_strict_neq);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    if (opcode == OP_eq || opcode == OP_neq) {
+      INLINE_COMMENT("js_eq_slow");
+      masm_call_stub(as, js_eq_slow, 1);
+    } else {
+      INLINE_COMMENT("js_strict_eq_slow");
+      masm_call_stub(as, js_strict_eq_slow, 1);
+    }
+    masm_cbnz(as, kRetReg, go.exception);
+
+    INLINE_COMMENT("ret_val = sp[-2]");
+    masm_ldr(as, kRetReg, kStkReg, -2 * 8);
+    INLINE_COMMENT("sp -= 2");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -2 * 8);
+    if (opcode == OP_eq || opcode == OP_strict_eq) {
+      INLINE_COMMENT("return ret_val == true");
+      masm_cmp_reg_imm32(as, kRetReg, 1);
+    } else {
+      INLINE_COMMENT("return ret_val == false");
+      masm_cmp_reg_imm32(as, kRetReg, 0);
+    }
+    masm_ret(as);
+  }
+
+  if (go.eq) {
+    if (!go.eq_slow) go.eq_slow = masm_new_label(as, "eq_slow_thunk");
+    masm_bind(as, go.eq);
+    masm_ldp(as, kArg1Reg, kArg2Reg, kStkReg, -2 * 8);
+    INLINE_COMMENT("is_neq = false");
+    masm_mov_reg_imm32(as, kArg3Reg, 0);
+    masm_cmp_reg(as, kArg1Reg, kArg2Reg);
+    masm_b_ne(as, go.eq_slow);
+    INLINE_COMMENT("sp[-2] = JS_TRUE");
+    masm_mov_reg_imm64(as, kArg4Reg, JS_TRUE);
+    masm_str(as, kArg4Reg, kStkReg, -2 * 8);
+
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+  if (go.neq) {
+    if (!go.eq_slow) go.eq_slow = masm_new_label(as, "eq_slow_thunk");
+    masm_bind(as, go.neq);
+    masm_ldp(as, kArg1Reg, kArg2Reg, kStkReg, -2 * 8);
+    INLINE_COMMENT("is_neq = true");
+    masm_mov_reg_imm32(as, kArg3Reg, 1);
+    masm_cmp_reg(as, kArg1Reg, kArg2Reg);
+    masm_b_ne(as, go.eq_slow);
+    INLINE_COMMENT("sp[-2] = JS_FALSE");
+    masm_mov_reg_imm64(as, kArg4Reg, JS_FALSE);
+    masm_str(as, kArg4Reg, kStkReg, -2 * 8);
+
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+  if (go.eq_slow) {
+    masm_bind(as, go.eq_slow);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("js_eq_slow");
+    masm_call_stub(as, js_eq_slow, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+
+  if (go.strict_eq) {
+    if (!go.strict_eq_slow) go.strict_eq_slow = masm_new_label(as, "strict_eq_slow_thunk");
+    masm_bind(as, go.strict_eq);
+    masm_ldp(as, kArg1Reg, kArg2Reg, kStkReg, -2 * 8);
+    INLINE_COMMENT("is_neq = false");
+    masm_mov_reg_imm32(as, kArg3Reg, 0);
+    masm_cmp_reg(as, kArg1Reg, kArg2Reg);
+    masm_b_ne(as, go.strict_eq_slow);
+    INLINE_COMMENT("sp[-2] = JS_TRUE");
+    masm_mov_reg_imm64(as, kArg4Reg, JS_TRUE);
+    masm_str(as, kArg4Reg, kStkReg, -2 * 8);
+
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+  if (go.strict_neq) {
+    if (!go.strict_eq_slow) go.strict_eq_slow = masm_new_label(as, "strict_eq_slow_thunk");
+    masm_bind(as, go.strict_neq);
+    masm_ldp(as, kArg1Reg, kArg2Reg, kStkReg, -2 * 8);
+    INLINE_COMMENT("is_neq = true");
+    masm_mov_reg_imm32(as, kArg3Reg, 1);
+    masm_cmp_reg(as, kArg1Reg, kArg2Reg);
+    masm_b_ne(as, go.strict_eq_slow);
+    INLINE_COMMENT("sp[-2] = JS_FALSE");
+    masm_mov_reg_imm64(as, kArg4Reg, JS_FALSE);
+    masm_str(as, kArg4Reg, kStkReg, -2 * 8);
+
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+  if (go.strict_eq_slow) {
+    masm_bind(as, go.strict_eq_slow);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("js_strict_eq_slow");
+    masm_call_stub(as, js_strict_eq_slow, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+
+  // push imm & cmp & if_true/false
+  for (int opcode = 0; opcode < 4; opcode++)
+  if (go.cmp_const[opcode]) {
+    masm_label_t slow = masm_new_label(as, NULL);
+    masm_bind(as, go.cmp_const[opcode]);
+    INLINE_COMMENT("v = *--sp");
+    masm_pop_reg(as, kArg1Reg);
+    masm_cmp_reg_imm64(as, kArg1Reg, 0xffffffff);
+    masm_b_hi(as, slow);
+
+    INLINE_COMMENT("v vs imm");
+    masm_cmp_reg32(as, kArg1Reg, kArg2Reg);
+    masm_cset(as, kRetReg, opcode);
+    masm_ret(as);
+
+    masm_bind(as, slow);
+    INLINE_COMMENT("op1");
+    masm_push_reg(as, kArg1Reg);
+    INLINE_COMMENT("op2");
+    masm_push_reg(as, kArg2Reg);
+    INLINE_COMMENT("opcode");
+    masm_push_c_arg_imm64(as, 3, OP_lt + opcode);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("js_relational_slow");
+    masm_call_stub(as, js_relational_slow, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+
+    INLINE_COMMENT("ret_val = sp[-2]");
+    masm_ldr(as, kRetReg, kStkReg, -2 * 8);
+    INLINE_COMMENT("sp -= 2");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -2 * 8);
+    masm_ret(as);
+  }
+
+  // cmp & if_true/false
+  for (int opcode = OP_lt; opcode <= OP_strict_neq; opcode++)
+  if (go.goto_if[opcode - OP_lt]) {
+    masm_label_t slow = masm_new_label(as, NULL);
+    masm_bind(as, go.goto_if[opcode - OP_lt]);
+    masm_ldp(as, kArg1Reg, kArg2Reg, kStkReg, -2 * 8);
+    masm_mov_reg_imm32(as, kArg4Reg, 0xffffffff);
+    masm_cmp_reg(as, kArg1Reg, kArg4Reg);
+    masm_b_hi(as, slow);
+    masm_cmp_reg(as, kArg2Reg, kArg4Reg);
+    masm_b_hi(as, slow);
+
+    INLINE_COMMENT("sp[-2] vs sp[-1]");
+    masm_cmp_reg32(as, kArg1Reg, kArg2Reg);
+    masm_cset(as, kRetReg, opcode - OP_lt);
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -2 * 8);
+    masm_ret(as);
+
+    masm_bind(as, slow);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    if (opcode < OP_eq) {
+      INLINE_COMMENT("opcode");
+      masm_push_c_arg_imm64(as, 3, opcode);
+      INLINE_COMMENT("js_relational_slow");
+      masm_call_stub(as, js_relational_slow, 1);
+    } else if (opcode == OP_eq || opcode == OP_neq) {
+      INLINE_COMMENT("is_neq");
+      masm_push_c_arg_imm64(as, 3, opcode == OP_neq);
+      INLINE_COMMENT("js_eq_slow");
+      masm_call_stub(as, js_eq_slow, 1);
+    } else {
+      INLINE_COMMENT("is_neq");
+      masm_push_c_arg_imm64(as, 3, opcode == OP_strict_neq);
+      INLINE_COMMENT("js_strict_eq_slow");
+      masm_call_stub(as, js_strict_eq_slow, 1);
+    }
+    masm_cbnz(as, kRetReg, go.exception);
+
+    INLINE_COMMENT("ret_val = sp[-2]");
+    masm_ldr(as, kRetReg, kStkReg, -2 * 8);
+    INLINE_COMMENT("sp -= 2");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -2 * 8);
+    masm_ret(as);
+  }
+
+  for (int opcode = 0; opcode < 4; opcode++)
+  if (go.lt[opcode]) {
+    if (!go.relational_slow) go.relational_slow = masm_new_label(as, "relational_slow_thunk");
+    masm_label_t set_result = masm_new_label(as, NULL);
+    masm_bind(as, go.lt[opcode]);
+    masm_ldp(as, kArg1Reg, kArg2Reg, kStkReg, -2 * 8);
+    INLINE_COMMENT(opcode == 0 ? "OP_lt" : opcode == 1 ? "OP_lte" : opcode == 2 ? "OP_gt" : "OP_gte");
+    masm_mov_reg_imm32(as, kArg3Reg, OP_lt + opcode);
+    masm_mov_reg_imm32(as, kArg4Reg, 0xffffffff);
+    masm_cmp_reg(as, kArg1Reg, kArg4Reg);
+    masm_b_hi(as, go.relational_slow);
+    masm_cmp_reg(as, kArg2Reg, kArg4Reg);
+    masm_b_hi(as, go.relational_slow);
+
+    INLINE_COMMENT("r = JS_FALSE");
+    masm_mov_reg_imm64(as, kArg4Reg, JS_FALSE);
+    INLINE_COMMENT("sp[-2] vs sp[-1]");
+    masm_cmp_reg32(as, kArg1Reg, kArg2Reg);
+    switch (opcode) {
+    case 0:
+        masm_b_ge(as, set_result); // !lt
+        break;
+    case 1:
+        masm_b_gt(as, set_result); // !lte
+        break;
+    case 2:
+        masm_b_le(as, set_result); // !gt
+        break;
+    case 3:
+        masm_b_lt(as, set_result); // !gte
+        break;
+    }
+
+    INLINE_COMMENT("r = JS_TRUE");
+    masm_add_reg_imm32(as, kArg4Reg, kArg4Reg, 1);
+
+    masm_bind(as, set_result);
+    INLINE_COMMENT("sp[-2] = r");
+    masm_str(as, kArg4Reg, kStkReg, -2 * 8);
+
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+
+  if (go.relational_slow) {
+    masm_bind(as, go.relational_slow);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("js_relational_slow");
+    masm_call_stub(as, js_relational_slow, 1);
+    masm_cbnz(as, kRetReg, go.exception);
+
+    INLINE_COMMENT("sp--");
+    masm_add_reg_imm32(as, kStkReg, kStkReg, -8);
+    masm_ret(as);
+  }
+
+  if (go.pop_bool) {
+    masm_bind(as, go.pop_bool);
+    INLINE_COMMENT("v = *--sp");
+    masm_pop_reg(as, kArg1Reg);
+    masm_lsr(as, kArg3Reg, kArg1Reg, 32);
+    INLINE_COMMENT("tag(v) <= JS_TAG_UNDEFINED");
+    masm_cmp_reg_imm32(as, kArg3Reg, JS_TAG_UNDEFINED + 1);
+    masm_label_t skip = masm_new_label(as, NULL);
+    masm_b_lo(as, skip);
+    masm_push_c_arg_reg(as, 2, kArg1Reg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("JS_ToBoolFree");
+    masm_call_stub(as, JS_ToBoolFree, 1);
+    masm_bind(as, skip);
+    masm_ret(as);
+  }
+
+  if (go.call) {
+    masm_bind(as, go.call);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("call_internal_stub");
+    masm_call_stub(as, call_internal_stub, 1);
+    masm_cmp_reg_imm64(as, kRetReg, JS_EXCEPTION);
+    masm_b_eq(as, go.done);
+    masm_ret(as);
+  }
+  if (go.call_method) {
+    masm_bind(as, go.call_method);
+    masm_push_c_arg_reg(as, 2, kStkReg);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("call_method_internal_stub");
+    masm_call_stub(as, call_method_internal_stub, 1);
+    masm_cmp_reg_imm64(as, kRetReg, JS_EXCEPTION);
+    masm_b_eq(as, go.done);
+    masm_ret(as);
+  }
+
+  if (go.object) {
+    masm_bind(as, go.object);
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    INLINE_COMMENT("JS_NewObject");
+    masm_call_stub(as, JS_NewObject, 1);
+    masm_cmp_reg_imm64(as, kRetReg, JS_EXCEPTION);
+    masm_b_eq(as, go.done);
+    masm_push_reg(as, kRetReg);
+    masm_ret(as);
+  }
+
+  if (go.get_loc_check) {
+    if (!go.push_dup) go.push_dup = masm_new_label(as, "push_dup_thunk");
+    if (!go.throw_uninit) go.throw_uninit = masm_new_label(as, "throw_uninit_thunk");
+    masm_bind(as, go.get_loc_check);
+    INLINE_COMMENT("JS_UNINITIALIZED");
+    masm_cmp_reg_imm64(as, kArg1Reg, JS_UNINITIALIZED);
+    masm_b_eq(as, go.throw_uninit);
+  }
+  if (go.push_dup) {
+    if (!go.dup) go.dup = masm_new_label(as, "dup_thunk");
+    masm_bind(as, go.push_dup);
+    INLINE_COMMENT("*sp++ = v");
+    masm_push_reg(as, kArg1Reg);
+  }
+  if (go.dup) {
+    masm_label_t skip = masm_new_label(as, NULL);
+    masm_bind(as, go.dup);
+    masm_lsr(as, kArg2Reg, kArg1Reg, 32);
+    INLINE_COMMENT("JS_TAG_FIRST");
+    masm_cmp_reg_imm32(as, kArg2Reg, JS_TAG_FIRST);
+    masm_b_lo(as, skip);
+    INLINE_COMMENT("p->ref_count++");
+    masm_inc32_rtmem(as, kArg1Reg);
+    masm_bind(as, skip);
+    masm_ret(as);
+  }
+
+  if (go.throw_uninit) {
+    masm_bind(as, go.throw_uninit);
+    masm_push_c_arg_imm64(as, 4, FALSE);
+    masm_push_c_arg_imm64(as, 3, 0); // imm32
+    masm_push_c_arg_imm64(as, 2, 0); // b
+    masm_push_c_arg_reg(as, 1, kCtxReg);
+    masm_call_stub(as, JS_ThrowReferenceErrorUninitialized2, 0);
+    masm_jmp(as, go.exception);
+    // if (unlikely(JS_IsUninitialized(var_buf[imm32]))) {
+    //     JS_ThrowReferenceErrorUninitialized2(ctx, b, imm32, FALSE);
+    //     goto exception;
+    // }
+  }
+
+  masm_bind(as, go.exception);
+  INLINE_COMMENT("JS_EXCEPTION");
+  masm_mov_reg_imm64(as, kRetReg, JS_EXCEPTION);
+
+  masm_bind(as, go.done);
+  masm_epilog(as);
+
+  func_name = JS_AtomGetStr(ctx, buf, sizeof(buf), b->func_name);
+  if (1||strcmp(func_name, "add") == 0 || strcmp(func_name, "f") == 0 ||
+      strcmp(func_name, "g") == 0 || strcmp(func_name, "times") == 0 ||
+      strcmp(func_name, "log") == 0) {
+    b->jit_code = masm_finish(as);
+  } else {
+    masm_finish(as);
+    b->jit_code = NULL;
+  }
+  masm_delete(as);
+  js_free(ctx, labels);
+}
+
 /* argument of OP_special_object */
 typedef enum {
     OP_SPECIAL_OBJECT_ARGUMENTS,
@@ -17686,6 +20768,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->prev_frame = rt->current_stack_frame;
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
+
+    if (!b->jited) {
+        b->jited = 1;
+        compile(rt, func_obj);
+    }
+
+    if (b->jit_code) {
+        JSValue (*fn)(void *sf, void *ctx) = b->jit_code;
+        sf->sp = sp;
+        ret_val = fn(sf, ctx);
+        sp = sf->sp;
+        if (ret_val == JS_EXCEPTION) goto exception;
+        goto done;
+    }
 
  restart:
     for(;;) {
@@ -31848,6 +34944,48 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     js_free(ctx, fd);
 }
 
+uint16_t* get_jump_targets(JSContext *ctx, JSFunctionBytecode *b)
+{
+    const JSOpCode *oi;
+    int pos, pos_next, op, addr;
+    uint16_t *bits = js_mallocz(ctx, b->byte_code_len * sizeof(*bits));
+
+    /* scan for jump targets */
+    for (pos = 0; pos < b->byte_code_len; pos = pos_next) {
+        op = b->byte_code_buf[pos];
+        oi = &short_opcode_info(op);
+        pos_next = pos + oi->size;
+        if (op < OP_COUNT) {
+            switch (oi->fmt) {
+#if SHORT_OPCODES
+            case OP_FMT_label8:
+                pos++;
+                addr = (int8_t)b->byte_code_buf[pos];
+                goto has_addr;
+            case OP_FMT_label16:
+                pos++;
+                addr = (int16_t)get_u16(b->byte_code_buf + pos);
+                goto has_addr;
+#endif
+            case OP_FMT_atom_label_u8:
+            case OP_FMT_atom_label_u16:
+                pos += 4;
+                /* fall thru */
+            case OP_FMT_label:
+            case OP_FMT_label_u16:
+                pos++;
+                addr = get_u32(b->byte_code_buf + pos);
+            has_addr:
+                addr += pos;
+                if (addr >= 0 && addr < b->byte_code_len)
+                    bits[addr] |= 1;
+                break;
+            }
+        }
+    }
+    return bits;
+}
+
 #ifdef DUMP_BYTECODE
 static const char *skip_lines(const char *p, int n) {
     while (n-- > 0 && *p) {
@@ -40824,8 +43962,8 @@ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
         return NULL;
     if (len64 > JS_MAX_LOCAL_VARS) {
         // XXX: check for stack overflow?
-        JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)",
-                           JS_MAX_LOCAL_VARS);
+        JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed but got %lld)",
+                           JS_MAX_LOCAL_VARS, len64);
         return NULL;
     }
     len = len64;

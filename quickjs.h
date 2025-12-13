@@ -247,15 +247,18 @@ typedef struct JSMallocState {
     size_t malloc_count;
     size_t malloc_size;
     size_t malloc_limit;
+    size_t upward_mark;
+    size_t downward_mark;
     void *opaque; /* user opaque */
-    void *firstfree[28];
+    struct JSChunkInfo *first_free_chunk;
+    struct JSPageInfo *first_free_page[12];
 } JSMallocState;
 
 typedef struct JSMallocFunctions {
     void *(*js_malloc)(JSMallocState *s, size_t size);
     void (*js_free)(JSMallocState *s, void *ptr);
     void *(*js_realloc)(JSMallocState *s, void *ptr, size_t size);
-    size_t (*js_malloc_usable_size)(const void *ptr);
+    size_t (*js_malloc_usable_size)(JSMallocState *s, const void *ptr);
 } JSMallocFunctions;
 
 typedef struct JSGCObjectHeader JSGCObjectHeader;

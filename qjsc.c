@@ -504,6 +504,7 @@ static int output_executable(const char *out_filename, const char *cfilename,
     *arg++ = libjsname;
     *arg++ = "-lm";
     *arg++ = "-ldl";
+    *arg++ = "-lc++";
     *arg++ = "-lpthread";
     *arg = NULL;
 

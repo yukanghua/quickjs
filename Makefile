@@ -161,10 +161,14 @@ DEFINES+=-DHAVE_CLOSEFROM
 endif
 endif
 
+# DEFINES+=-DASMJIT_NO_LOGGING=1 -DASMJIT_NO_INTROSPECTION=1 -DASMJIT_NO_TEXT=1
+DEFINES+=-DASMJIT_STATIC=1 -DASMJIT_NO_UJIT=1 -DASMJIT_NO_FOREIGN=1 -DASMJIT_NO_COMPILER=1 -DASMJIT_NO_ABI_NAMESPACE=1
+ASMJIT_OPT=-Iasmjit -std=c++17 -fno-rtti
+
 CFLAGS+=$(DEFINES)
 CFLAGS_DEBUG=$(CFLAGS) -O0
 CFLAGS_SMALL=$(CFLAGS) -Os
-CFLAGS_OPT=$(CFLAGS) -O2
+CFLAGS_OPT=$(CFLAGS) -O0
 CFLAGS_NOLTO:=$(CFLAGS_OPT)
 ifdef CONFIG_COSMO
 LDFLAGS+=-s # better to strip by default
@@ -243,14 +247,74 @@ endif
 
 all: $(OBJDIR) $(PROGS)
 
-QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/dtoa.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o
+CODEGEN_OBJS=$(OBJDIR)/codegen.o \
+	$(OBJDIR)/emitterutils.o \
+	$(OBJDIR)/inst.o \
+	$(OBJDIR)/rapass.o \
+	$(OBJDIR)/assembler.o \
+	$(OBJDIR)/funcargscontext.o \
+	$(OBJDIR)/emitter.o \
+	$(OBJDIR)/ralocal.o \
+	$(OBJDIR)/func.o \
+	$(OBJDIR)/globals.o \
+	$(OBJDIR)/osutils.o \
+	$(OBJDIR)/string.o \
+	$(OBJDIR)/archtraits.o \
+	$(OBJDIR)/instdb.o \
+	$(OBJDIR)/formatter.o \
+	$(OBJDIR)/constpool.o \
+	$(OBJDIR)/virtmem.o \
+	$(OBJDIR)/cpuinfo.o \
+	$(OBJDIR)/type.o \
+	$(OBJDIR)/logger.o \
+	$(OBJDIR)/target.o \
+	$(OBJDIR)/codeholder.o \
+	$(OBJDIR)/emithelper.o \
+	$(OBJDIR)/jitallocator.o \
+	$(OBJDIR)/errorhandler.o \
+	$(OBJDIR)/builder.o \
+	$(OBJDIR)/environment.o \
+	$(OBJDIR)/jitruntime.o \
+	$(OBJDIR)/codewriter.o \
+	$(OBJDIR)/operand.o \
+	$(OBJDIR)/rastack.o \
+	$(OBJDIR)/arenahash.o \
+	$(OBJDIR)/support.o \
+	$(OBJDIR)/arena.o \
+	$(OBJDIR)/arenavector.o \
+	$(OBJDIR)/arenalist.o \
+	$(OBJDIR)/arenatree.o \
+	$(OBJDIR)/arenabitset.o \
+	$(OBJDIR)/x86operand.o \
+	$(OBJDIR)/x86instapi.o \
+	$(OBJDIR)/x86formatter.o \
+	$(OBJDIR)/x86builder.o \
+	$(OBJDIR)/x86assembler.o \
+	$(OBJDIR)/x86emithelper.o \
+	$(OBJDIR)/x86instdb.o \
+	$(OBJDIR)/x86func.o \
+	$(OBJDIR)/x86rapass.o \
+	$(OBJDIR)/x86compiler.o \
+	$(OBJDIR)/a64operand.o \
+	$(OBJDIR)/a64instapi.o \
+	$(OBJDIR)/a64rapass.o \
+	$(OBJDIR)/a64instdb.o \
+	$(OBJDIR)/a64builder.o \
+	$(OBJDIR)/a64emithelper.o \
+	$(OBJDIR)/a64formatter.o \
+	$(OBJDIR)/a64func.o \
+	$(OBJDIR)/a64compiler.o \
+	$(OBJDIR)/armformatter.o \
+	$(OBJDIR)/a64assembler.o
+
+QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(CODEGEN_OBJS) $(OBJDIR)/dtoa.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o
 
 QJS_OBJS=$(OBJDIR)/qjs.o $(OBJDIR)/repl.o $(QJS_LIB_OBJS)
 
 HOST_LIBS=-lm -ldl
 LIBS=-lm
 ifndef CONFIG_WIN32
-LIBS+=-ldl
+LIBS+=-ldl -lc++
 endif
 LIBS+=$(EXTRA_LIBS)
 
@@ -332,6 +396,17 @@ run-test262-debug: $(patsubst %.o, %.debug.o, $(OBJDIR)/run-test262.o $(QJS_LIB_
 $(OBJDIR)/%.o: %.c | $(OBJDIR)
 	$(CC) $(CFLAGS_OPT) -c -o $@ $<
 
+$(OBJDIR)/%.o: %.cc | $(OBJDIR)
+	$(CC) $(CFLAGS_OPT) $(ASMJIT_OPT) -c -o $@ $<
+$(OBJDIR)/%.o: asmjit/asmjit/core/%.cpp | $(OBJDIR)
+	$(CC) $(CFLAGS_OPT) $(ASMJIT_OPT) -c -o $@ $<
+$(OBJDIR)/%.o: asmjit/asmjit/support/%.cpp | $(OBJDIR)
+	$(CC) $(CFLAGS_OPT) $(ASMJIT_OPT) -c -o $@ $<
+$(OBJDIR)/%.o: asmjit/asmjit/x86/%.cpp | $(OBJDIR)
+	$(CC) $(CFLAGS_OPT) $(ASMJIT_OPT) -c -o $@ $<
+$(OBJDIR)/%.o: asmjit/asmjit/arm/%.cpp | $(OBJDIR)
+	$(CC) $(CFLAGS_OPT) $(ASMJIT_OPT) -c -o $@ $<
+
 $(OBJDIR)/fuzz_%.o: fuzz/fuzz_%.c | $(OBJDIR)
 	$(CC) $(CFLAGS_OPT) -c -I. -o $@ $<
 
@@ -343,6 +418,16 @@ $(OBJDIR)/%.pic.o: %.c | $(OBJDIR)
 
 $(OBJDIR)/%.nolto.o: %.c | $(OBJDIR)
 	$(CC) $(CFLAGS_NOLTO) -c -o $@ $<
+$(OBJDIR)/%.nolto.o: %.cc | $(OBJDIR)
+	$(CC) $(CFLAGS_NOLTO) $(ASMJIT_OPT) -c -o $@ $<
+$(OBJDIR)/%.nolto.o: asmjit/asmjit/core/%.cpp | $(OBJDIR)
+	$(CC) $(CFLAGS_NOLTO) $(ASMJIT_OPT) -c -o $@ $<
+$(OBJDIR)/%.nolto.o: asmjit/asmjit/support/%.cpp | $(OBJDIR)
+	$(CC) $(CFLAGS_NOLTO) $(ASMJIT_OPT) -c -o $@ $<
+$(OBJDIR)/%.nolto.o: asmjit/asmjit/x86/%.cpp | $(OBJDIR)
+	$(CC) $(CFLAGS_NOLTO) $(ASMJIT_OPT) -c -o $@ $<
+$(OBJDIR)/%.nolto.o: asmjit/asmjit/arm/%.cpp | $(OBJDIR)
+	$(CC) $(CFLAGS_NOLTO) $(ASMJIT_OPT) -c -o $@ $<
 
 $(OBJDIR)/%.debug.o: %.c | $(OBJDIR)
 	$(CC) $(CFLAGS_DEBUG) -c -o $@ $<
