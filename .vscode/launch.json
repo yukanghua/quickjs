@@ -1,0 +1,58 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "quickjs",
+      "request": "launch",
+      "port": 5555,
+      //"mode": "connect",
+      "name": "Launch QuickJS",
+      "runtimeExecutable": "${workspaceFolder}/qjs-debug",
+      "localRoot": "${workspaceFolder}/",
+      "program": "^\"${workspaceFolder}/test.js\""
+    }, {
+      "type": "cppdbg",
+      "name": "qjsc",
+      "request": "launch",
+      "program": "${workspaceFolder}/qjsc",
+      "cwd": "${workspaceFolder}",
+      "MIMode": "lldb",
+      "args": ["-s", "-c", "-o", "repl.c", "-m", "repl.js"]
+    }, {
+      "type": "cppdbg",
+      "name": "octane",
+      "request": "launch",
+      "program": "${workspaceFolder}/qjs",
+      "cwd": "${workspaceFolder}",
+      "MIMode": "lldb",
+      "args": ["octane/run.js"]
+    }, {
+      "type": "cppdbg",
+      "name": "microbench",
+      "request": "launch",
+      "program": "${workspaceFolder}/qjs",
+      "cwd": "${workspaceFolder}",
+      "MIMode": "lldb",
+      "args": ["tests/microbench.js"]
+    }, {
+      "type": "cppdbg",
+      "name": "test3",
+      "request": "launch",
+      "program": "${workspaceFolder}/qjs",
+      "cwd": "${workspaceFolder}",
+      "MIMode": "lldb",
+      "args": ["test3.js"]
+    }, {
+      "type": "cppdbg",
+      "name": "bigint",
+      "request": "launch",
+      "program": "${workspaceFolder}/qjs",
+      "cwd": "${workspaceFolder}",
+      "MIMode": "lldb",
+      "args": ["tests/test_bigint.js"]
+    }
+  ]
+}
